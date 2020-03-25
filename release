@@ -1,0 +1,5 @@
+#!/bin/bash
+
+rm -rf dist MANIFEST
+python3 setup.py sdist
+twine upload dist/*
