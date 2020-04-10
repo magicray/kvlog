@@ -70,6 +70,24 @@ def has_quorum(state):
     return len(state['followers']) >= quorum(state)
 
 
+def committed_seq(state):
+    idx = quorum(state)
+
+    if idx < len(state['followers']):
+        return 0
+
+    return sorted(list(state['followers'].values()), reverse=True)[idx-1]
+
+
+def term_and_seq(sql):
+    seq = sql('select max(seq) from kv').fetchone()[0]
+    term = sql('''select seq from kv
+                  where key is null order by seq desc limit 1
+               ''').fetchone()[0]
+
+    return term, seq
+
+
 async def handler(reader, writer):
     request, headers = await read_http(reader)
     method, url, _ = request.split()
@@ -126,13 +144,10 @@ async def handler(reader, writer):
         log('get(%s) keys(%d) seq(%d)', url[0], len(res), seq)
         return writer.close()
 
-    def committed_seq():
-        idx = quorum(state)
-
-        if idx < len(state['followers']):
-            return 0
-
-        return sorted(list(state['followers'].values()), reverse=True)[idx-1]
+    def log_prefix():
+        i = 1 if '127.0.0.1' == sockname[0] else 0
+        return 'master({}) slave({}) role({}) db({})'.format(
+            sockname[i], peername[i], state['role'], url[0])
 
     # SYNC
     try:
@@ -140,15 +155,11 @@ async def handler(reader, writer):
 
         peer_term, peer_seq = struct.unpack(
             '!QQ', await reader.readexactly(16))
-        peer_chksum = (await reader.readexactly(32)).decode()
+        peer_chksum = await reader.readexactly(16)
 
-        log('master%s slave%s quorum(%s) db(%s) term(%d) seq(%d)',
-            sockname, peername, has_quorum(state), url[0], peer_term, peer_seq)
+        log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
 
-        myseq = sql('select max(seq) from kv').fetchone()[0]
-        myterm = sql('''select seq from kv
-                        where key is null order by seq desc limit 1
-                     ''').fetchone()[0]
+        myterm, myseq = term_and_seq(sql)
         sql.rollback()
 
         mychksum = state['chksum']
@@ -195,8 +206,8 @@ async def handler(reader, writer):
                 writer.write(struct.pack('!Q', len(value)))
                 writer.write(value)
 
-                log('master%s slave%s db(%s) seq(%d) key(%d) value(%d)',
-                    sockname, peername, url[0], seq, len(key), len(value))
+                log('%s seq(%d) key(%d) value(%d)',
+                    log_prefix(), seq, len(key), len(value))
 
                 count += 1
 
@@ -205,13 +216,17 @@ async def handler(reader, writer):
             assert('following' not in state)
 
             writer.write(struct.pack('!Q', 0))
-            next_seq = struct.unpack('!Q', await reader.readexactly(8))[0]
-            state['followers'][peername] = next_seq - 1
+
+            peer_term, peer_seq = struct.unpack(
+                '!QQ', await reader.readexactly(16))
+
+            state['followers'][peername] = peer_seq
+            next_seq = peer_seq + 1
 
             if 'voter' == state['role'] and has_quorum(state):
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
-                if max_seq == committed_seq():
+                if max_seq == committed_seq(state):
                     sql('insert into kv values(null, null, null)')
                     state['role'] = 'candidate'
 
@@ -219,15 +234,15 @@ async def handler(reader, writer):
             elif 'candidate' == state['role'] and has_quorum(state):
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
-                if max_seq == committed_seq():
+                if max_seq == committed_seq(state):
                     state['role'] = 'leader'
 
                 sql.rollback()
 
-            log('master%s slave%s role(%s) db(%s) next(%d) count(%d)',
-                sockname, peername, state['role'], url[0], next_seq, count)
-
-            if 0 == count:
+            if count or 'candidate' == state['role']:
+                log('%s term(%d) seq(%d) sent(%d)',
+                    log_prefix(), peer_term, peer_seq, count)
+            else:
                 await asyncio.sleep(1)
     except Exception:
         state['followers'].pop(peername, None)
@@ -257,19 +272,19 @@ async def sync_task(db):
                 reader = None
                 continue
 
+            i = 1 if '127.0.0.1' == sockname[0] else 0
+            log_prefix = 'slave({}) master({}) db({})'.format(
+                sockname[i], peername[i], db)
+
             try:
                 writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
 
-                seq = sql('select max(seq) from kv').fetchone()[0]
-                term = sql('''select seq from kv
-                              where key is null order by seq desc limit 1
-                           ''').fetchone()[0]
+                term, seq = term_and_seq(sql)
 
                 writer.write(struct.pack('!QQ', term, seq))
-                writer.write(state['chksum'].encode())
+                writer.write(state['chksum'])
 
-                log('slave%s master%s db(%s) term(%d) seq(%d)',
-                    sockname, peername, db, term, seq)
+                log('%s term(%d) seq(%d)', log_prefix, term, seq)
 
                 await reader.readexactly(8)
                 break
@@ -284,6 +299,7 @@ async def sync_task(db):
 
     state['following'] = (ip, port)
     while True:
+        count = 0
         while True:
             seq = struct.unpack('!Q', await reader.readexactly(8))[0]
 
@@ -302,14 +318,20 @@ async def sync_task(db):
             sql('insert into kv values(?,?,?)', seq,
                 key if key else None, value if value else None)
 
-            log('slave%s master%s db(%s) seq(%d) key(%d) value(%d)',
-                sockname, peername, db, seq, len(key), len(value))
+            log('%s seq(%d) key(%d) value(%d)',
+                log_prefix, seq, len(key), len(value))
+
+            count += 1
 
         sql.commit()
-        seq = sql('select max(seq) from kv').fetchone()[0]
-        log('slave%s master%s db(%s) committed(%d)',
-            sockname, peername, db, seq)
-        writer.write(struct.pack('!Q', seq+1))
+
+        term, seq = term_and_seq(sql)
+
+        if count:
+            log('%s term(%d) seq(%d) received(%d)',
+                log_prefix, term, seq, count)
+
+        writer.write(struct.pack('!QQ', term, seq))
 
 
 def server():
@@ -330,11 +352,9 @@ def server():
 
         state['role'] = 'voter'
         state['followers'] = dict()
-        state['chksum'] = hashlib.md5((
-            db + str(args.peers)).encode()).hexdigest()
+        state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
 
         asyncio.ensure_future(sync_task(db))
-        break
 
     def exception_handler(loop, context):
         log(context['future'])
