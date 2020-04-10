@@ -4,6 +4,7 @@ import glob
 import struct
 import sqlite3
 import asyncio
+import hashlib
 import logging
 import argparse
 import urllib.parse
@@ -61,6 +62,14 @@ def write_http(writer, status, obj=None):
         json.dumps(obj if obj else status, indent=4, sort_keys=True).encode())
 
 
+def quorum(state):
+    return int((len(args.peers) + 1) / 2)
+
+
+def has_quorum(state):
+    return len(state['followers']) >= quorum(state)
+
+
 async def handler(reader, writer):
     request, headers = await read_http(reader)
     method, url, _ = request.split()
@@ -78,6 +87,9 @@ async def handler(reader, writer):
     sql = SQLite(os.path.join('db', url[0]))
     state = STATE[url[0]]
 
+    peername = writer.get_extra_info('peername')
+    sockname = writer.get_extra_info('sockname')
+
     content_length = int(headers.get('content-length', '0'))
 
     # PUT
@@ -88,7 +100,7 @@ async def handler(reader, writer):
             key = key.encode()
             value = json.dumps(value).encode()
 
-            sql('delete from kv where key=?', key.decode())
+            sql('delete from kv where key=?', key)
             sql('insert into kv values(null,?,?)', key, value)
 
         seq = sql('select max(seq) from kv').fetchone()[0]
@@ -114,147 +126,218 @@ async def handler(reader, writer):
         log('get(%s) keys(%d) seq(%d)', url[0], len(res), seq)
         return writer.close()
 
+    def committed_seq():
+        idx = quorum(state)
+
+        if idx < len(state['followers']):
+            return 0
+
+        return sorted(list(state['followers'].values()), reverse=True)[idx-1]
+
     # SYNC
-    if 1 == len(url):
-        while True:
-            peer_term, peer_seq = struct.unpack(
-                '!QQ', await reader.readexactly(16))
+    try:
+        assert('following' not in state)
 
-            log('master(%s) term(%d) seq(%d)', url[0], peer_term, peer_seq)
+        peer_term, peer_seq = struct.unpack(
+            '!QQ', await reader.readexactly(16))
+        peer_chksum = (await reader.readexactly(32)).decode()
 
-            myseq = sql('select max(seq) from kv').fetchone()[0]
-            myterm = sql('''select seq from kv
-                            where key is null order by seq desc limit 1
-                         ''').fetchone()[0]
-            sql.rollback()
+        log('master%s slave%s quorum(%s) db(%s) term(%d) seq(%d)',
+            sockname, peername, has_quorum(state), url[0], peer_term, peer_seq)
 
-            if (myterm, myseq) < (peer_term, peer_seq):
+        myseq = sql('select max(seq) from kv').fetchone()[0]
+        myterm = sql('''select seq from kv
+                        where key is null order by seq desc limit 1
+                     ''').fetchone()[0]
+        sql.rollback()
+
+        mychksum = state['chksum']
+        if (myterm, myseq, mychksum) <= (peer_term, peer_seq, peer_chksum):
+            if len(state['followers']) < len(args.peers)/2:
                 return writer.close()
 
-            next_seq = None
+        next_seq = None
 
-            if myterm == peer_term:
+        if myterm == peer_term:
+            next_seq = peer_seq + 1
+
+        if myterm > peer_term:
+            seq = sql('''select seq from kv where key is null and seq > ?
+                         order by seq limit 1
+                      ''', peer_term).fetchone()[0]
+
+            if peer_seq >= seq:
+                next_seq = seq
+            else:
                 next_seq = peer_seq + 1
 
-            if myterm > peer_term:
-                seq = sql('''select seq from kv where key is null and seq > ?
-                             order by seq limit 1
-                          ''', peer_term).fetchone()[0]
+        if next_seq is None:
+            log('this should not happend - my(%d %d) peer(%d %d)',
+                myseq, myterm, peer_seq, peer_term)
+            return writer.close()
 
-                if peer_seq > seq:
-                    next_seq = seq
-                else:
-                    next_seq = peer_seq + 1
+        # All good. sync can start now
+        writer.write(struct.pack('!Q', 0))
 
-            if next_seq is None:
-                log('this should not happend - my(%d %d) peer(%d %d)',
-                    myseq, myterm, peer_seq, peer_term)
-                return writer.close()
+        while True:
+            cur = sql('select seq, key, value from kv where seq >= ?',
+                      next_seq)
 
-            while True:
-                cur = sql('select seq, key, value from kv where seq >= ?',
-                          next_seq)
+            seq, count = 0, 0
+            for seq, key, value in cur:
+                writer.write(struct.pack('!Q', seq))
 
-                seq, count = 0, 0
-                for seq, key, value in cur:
-                    writer.write(struct.pack('!Q', seq))
-                    writer.write(struct.pack('!Q', len(key)))
-                    writer.write(key)
-                    writer.write(struct.pack('!Q', len(value)))
-                    writer.write(value)
+                key = key if key else b''
+                writer.write(struct.pack('!Q', len(key)))
+                writer.write(key)
 
-                    log('master(%s) seq(%d) key(%d) value(%d)',
-                        url[0], seq, len(key), len(value))
+                value = value if value else b''
+                writer.write(struct.pack('!Q', len(value)))
+                writer.write(value)
 
-                    next_seq = seq + 1
-                    count += 1
+                log('master%s slave%s db(%s) seq(%d) key(%d) value(%d)',
+                    sockname, peername, url[0], seq, len(key), len(value))
+
+                count += 1
+
+            sql.rollback()
+
+            assert('following' not in state)
+
+            writer.write(struct.pack('!Q', 0))
+            next_seq = struct.unpack('!Q', await reader.readexactly(8))[0]
+            state['followers'][peername] = next_seq - 1
+
+            if 'voter' == state['role'] and has_quorum(state):
+                max_seq = sql('select max(seq) from kv').fetchone()[0]
+
+                if max_seq == committed_seq():
+                    sql('insert into kv values(null, null, null)')
+                    state['role'] = 'candidate'
+
+                sql.commit()
+            elif 'candidate' == state['role'] and has_quorum(state):
+                max_seq = sql('select max(seq) from kv').fetchone()[0]
+
+                if max_seq == committed_seq():
+                    state['role'] = 'leader'
 
                 sql.rollback()
 
-                if 0 == count:
-                    await asyncio.sleep(1)
-                else:
-                    writer.write(struct.pack('!Q', 0))
-                    log('master(%s) next(%d) count(%d)',
-                        url[0], next_seq, count)
+            log('master%s slave%s role(%s) db(%s) next(%d) count(%d)',
+                sockname, peername, state['role'], url[0], next_seq, count)
 
-    # Should never reach here
-    assert(False)
+            if 0 == count:
+                await asyncio.sleep(1)
+    except Exception:
+        state['followers'].pop(peername, None)
+        log('master%s slave%s quorum(%s) db(%s)',
+            sockname, peername, has_quorum(state), url[0])
+        if 'voter' != state['role'] and has_quorum(state) is False:
+            os._exit(1)
+
+    writer.close()
 
 
 async def sync_task(db):
+    sql = SQLite(os.path.join('db', db))
+    state = STATE[db]
+
     while True:
-        for ip, port in STATE[db]['cluster']:
+        if has_quorum(state):
+            return
+
+        for ip, port in args.peers:
             try:
                 reader, writer = await asyncio.open_connection(ip, port)
+
+                peername = writer.get_extra_info('peername')
+                sockname = writer.get_extra_info('sockname')
             except Exception:
+                reader = None
                 continue
 
-            writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
+            try:
+                writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
 
-            sql = SQLite(os.path.join('db', db))
+                seq = sql('select max(seq) from kv').fetchone()[0]
+                term = sql('''select seq from kv
+                              where key is null order by seq desc limit 1
+                           ''').fetchone()[0]
 
-            seq = sql('select max(seq) from kv').fetchone()[0]
-            term = sql('''select seq from kv
-                          where key is null order by seq desc limit 1
-                       ''').fetchone()[0]
+                writer.write(struct.pack('!QQ', term, seq))
+                writer.write(state['chksum'].encode())
 
-            writer.write(struct.pack('!QQ', term, seq))
+                log('slave%s master%s db(%s) term(%d) seq(%d)',
+                    sockname, peername, db, term, seq)
 
-            log('slave(%s) master(%s:%d) term(%d) seq(%d)',
-                db, ip, port, term, seq)
+                await reader.readexactly(8)
+                break
+            except Exception:
+                reader = None
+                writer.close()
 
-            while True:
-                count = 0
-                while True:
-                    seq = struct.unpack('!Q', await reader.readexactly(8))[0]
-                    if 0 == seq:
-                        sql.commit()
-                        log('slave(%s) master(%s:%d) committed(%d)',
-                            db, ip, port, count)
-                        break
-
-                    key = await reader.readexactly(
-                        struct.unpack('!Q', await reader.readexactly(8))[0])
-                    value = await reader.readexactly(
-                        struct.unpack('!Q', await reader.readexactly(8))[0])
-
-                    sql('delete from kv where seq >= ?', seq)
-                    sql('insert into kv values(?,?,?)', seq, key, value)
-
-                    log('slave(%s) master(%s:%d) seq(%d) key(%d) value(%d)',
-                        db, ip, port, seq, len(key), len(value))
-
-                    count += 1
-
-                await asyncio.sleep(1)
+        if reader:
+            break
 
         await asyncio.sleep(1)
+
+    state['following'] = (ip, port)
+    while True:
+        while True:
+            seq = struct.unpack('!Q', await reader.readexactly(8))[0]
+
+            if 0 == seq:
+                break
+
+            key = await reader.readexactly(
+                struct.unpack('!Q', await reader.readexactly(8))[0])
+            value = await reader.readexactly(
+                struct.unpack('!Q', await reader.readexactly(8))[0])
+
+            if key:
+                sql('delete from kv where key=?', key)
+
+            sql('delete from kv where seq >= ?', seq)
+            sql('insert into kv values(?,?,?)', seq,
+                key if key else None, value if value else None)
+
+            log('slave%s master%s db(%s) seq(%d) key(%d) value(%d)',
+                sockname, peername, db, seq, len(key), len(value))
+
+        sql.commit()
+        seq = sql('select max(seq) from kv').fetchone()[0]
+        log('slave%s master%s db(%s) committed(%d)',
+            sockname, peername, db, seq)
+        writer.write(struct.pack('!Q', seq+1))
 
 
 def server():
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(asyncio.start_server(handler, args.ip, args.port))
+    loop.run_until_complete(asyncio.start_server(handler, '', args.port))
+
+    args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
+        p.split(':') for p in args.peers.split(',')]])
 
     for db in sorted(glob.glob('db/*.sqlite3')):
         db = '.'.join(os.path.basename(db).split('.')[:-1])
-        sql = SQLite(os.path.join('db', db))
+        # sql = SQLite(os.path.join('db', db))
         state = STATE.setdefault(db, dict())
 
-        cluster = sql('select value from kv where seq=0').fetchone()[0]
-        sql.rollback()
+        # cluster = sql('select value from kv where seq=0').fetchone()[0]
+        # sql.rollback()
 
-        state['cluster'] = sorted(json.loads(cluster))
-        state['committed'] = 0
-        state['followers'] = 0
-        state['following'] = False
+        state['role'] = 'voter'
+        state['followers'] = dict()
+        state['chksum'] = hashlib.md5((
+            db + str(args.peers)).encode()).hexdigest()
 
         asyncio.ensure_future(sync_task(db))
         break
 
     def exception_handler(loop, context):
-        import pprint; pprint.pprint(context)
+        log(context['future'])
         os._exit(1)
 
     loop.set_exception_handler(exception_handler)
@@ -272,28 +355,21 @@ def init():
         value blob)''')
     sql('create unique index if not exists key on kv(key)')
 
-    if args.cluster:
-        val = json.dumps(sorted([
-            (c.split(':')[0].strip(), int(c.split(':')[1].strip()))
-            for c in args.cluster.split(',')]))
-
-        sql('delete from kv where seq=0')
-        sql('insert into kv values(0,null,?)', val)
-        sql.commit()
-    else:
-        cluster = sql('select value from kv where seq=0').fetchone()[0]
-        for ip, port in json.loads(cluster):
-            print('{}:{}'.format(ip, port))
+    sql('delete from kv where seq=0')
+    sql('insert into kv values(0, null, ?)', args.password)
+    sql.commit()
 
 
 if __name__ == '__main__':
     # openssl req -x509 -nodes -subj / -sha256 --keyout ssl.key --out ssl.cert
 
     args = argparse.ArgumentParser()
-    args.add_argument('--db', dest='db')
-    args.add_argument('--ip', dest='ip')
     args.add_argument('--port', dest='port', type=int)
-    args.add_argument('--cluster', dest='cluster')
+    args.add_argument('--peers', dest='peers')
+    args.add_argument('--token', dest='token')
+
+    args.add_argument('--db', dest='db')
+    args.add_argument('--password', dest='password')
     args = args.parse_args()
 
     server() if args.port else init()
