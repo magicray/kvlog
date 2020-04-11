@@ -1,6 +1,8 @@
 import os
 import json
 import glob
+import time
+import signal
 import struct
 import sqlite3
 import asyncio
@@ -71,12 +73,12 @@ def has_quorum(state):
 
 
 def committed_seq(state):
-    idx = quorum(state)
-
-    if idx < len(state['followers']):
+    if not has_quorum(state):
         return 0
 
-    return sorted(list(state['followers'].values()), reverse=True)[idx-1]
+    commits = sorted(list(state['followers'].values()), reverse=True)
+
+    return commits[quorum(state) - 1]
 
 
 def term_and_seq(sql):
@@ -92,11 +94,14 @@ async def handler(reader, writer):
     request, headers = await read_http(reader)
     method, url, _ = request.split()
 
-    url = url.split('/')[1:]
+    url = url.strip('/')
 
     if not url:
-        write_http(writer, '200 OK', STATE)
+        write_http(writer, '200 OK', {k: (v['role'], committed_seq(STATE[k]))
+                                      for k, v in STATE.items()})
         return writer.close()
+
+    url = url.split('/')
 
     if url[0] not in STATE:
         write_http(writer, '404 Not Found')
@@ -110,8 +115,17 @@ async def handler(reader, writer):
 
     content_length = int(headers.get('content-length', '0'))
 
+    if method.lower() in ('get', 'put', 'post'):
+        no_quorum = not has_quorum(state)
+        not_a_leader = 'leader' != state['role']
+        is_a_follower = 'following' in state
+
+        if not_a_leader or is_a_follower or no_quorum:
+            write_http(writer, '503 Service Unavailable', state)
+            return writer.close()
+
     # PUT
-    if content_length:
+    if method.lower() in ('put', 'post') and content_length:
         content = await reader.read(content_length)
         items = json.loads(content.decode())
         for key, value in items.items():
@@ -129,7 +143,7 @@ async def handler(reader, writer):
         return writer.close()
 
     # GET
-    if 2 == len(url):
+    if method.lower() in ('get') and 2 == len(url):
         res = dict()
         for key in [k.strip() for k in url[1].split(',')]:
             k = key.encode()
@@ -143,6 +157,8 @@ async def handler(reader, writer):
         write_http(writer, '200 OK', res)
         log('get(%s) keys(%d) seq(%d)', url[0], len(res), seq)
         return writer.close()
+
+    assert(method.lower() in ('sync'))
 
     def log_prefix():
         i = 1 if '127.0.0.1' == sockname[0] else 0
@@ -246,9 +262,10 @@ async def handler(reader, writer):
                 await asyncio.sleep(1)
     except Exception:
         state['followers'].pop(peername, None)
-        log('master%s slave%s quorum(%s) db(%s)',
-            sockname, peername, has_quorum(state), url[0])
+        log('%s quorum(%s)', log_prefix(), has_quorum(state))
+
         if 'voter' != state['role'] and has_quorum(state) is False:
+            log('%s quorum lost. exiting..', log_prefix())
             os._exit(1)
 
     writer.close()
@@ -272,9 +289,10 @@ async def sync_task(db):
                 reader = None
                 continue
 
-            i = 1 if '127.0.0.1' == sockname[0] else 0
             log_prefix = 'slave({}) master({}) db({})'.format(
-                sockname[i], peername[i], db)
+                sockname[1 if '127.0.0.1' == sockname[0] else 0],
+                peername[1 if '127.0.0.1' == peername[0] else 0],
+                db)
 
             try:
                 writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
@@ -297,7 +315,9 @@ async def sync_task(db):
 
         await asyncio.sleep(1)
 
+    assert(has_quorum(state) is False)
     state['following'] = (ip, port)
+
     while True:
         count = 0
         while True:
@@ -336,6 +356,8 @@ async def sync_task(db):
 
 def server():
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
+    signal.alarm(args.timeout)
+
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.start_server(handler, '', args.port))
 
@@ -386,7 +408,10 @@ if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--port', dest='port', type=int)
     args.add_argument('--peers', dest='peers')
-    args.add_argument('--token', dest='token')
+    args.add_argument('--token', dest='token',
+                      default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
+    args.add_argument('--timeout', dest='timeout', type=int,
+                      default=int(time.time()*10**9 % 60))
 
     args.add_argument('--db', dest='db')
     args.add_argument('--password', dest='password')
