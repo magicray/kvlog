@@ -1,2 +1,2 @@
 # syncedb
-Synchronously replicated key value store using sqlite and raft like replication
+Synchronously replicated key value store using sqlite. Replication is raft-like while leader election is paxos based.
