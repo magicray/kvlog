@@ -97,8 +97,11 @@ async def handler(reader, writer):
     url = url.strip('/')
 
     if not url:
-        write_http(writer, '200 OK', {k: (v['role'], committed_seq(STATE[k]))
-                                      for k, v in STATE.items()})
+        write_http(writer, '200 OK', {
+            k: dict(role=v['role'],
+                    committed=committed_seq(STATE[k]))
+            for k, v in STATE.items()})
+
         return writer.close()
 
     url = url.split('/')
@@ -191,8 +194,14 @@ async def handler(reader, writer):
 
         sql.rollback()
 
-        # All good. sync can start now
         state['followers'][peername] = 0
+        while has_quorum(state) is False:
+            await asyncio.sleep(0.1)
+
+        assert('following' not in state)
+        state['role'] = 'quorum'
+
+        # All good. sync can start now
         writer.write(struct.pack('!Q', 0))
 
         while True:
@@ -222,12 +231,11 @@ async def handler(reader, writer):
             peer_term, peer_seq = struct.unpack(
                 '!QQ', await reader.readexactly(16))
 
-            assert('following' not in state)
             state['followers'][peername] = peer_seq
 
             next_seq = peer_seq + 1
 
-            if 'voter' == state['role'] and has_quorum(state):
+            if 'quorum' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 if max_seq == committed_seq(state):
@@ -236,7 +244,7 @@ async def handler(reader, writer):
                     state['role'] = 'candidate'
 
                 sql.commit()
-            elif 'candidate' == state['role'] and has_quorum(state):
+            elif 'candidate' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 if max_seq == committed_seq(state):
@@ -252,10 +260,10 @@ async def handler(reader, writer):
     except Exception:
         sql.rollback()
         state['followers'].pop(peername, None)
-        log('%s quorum(%s)', log_prefix(), has_quorum(state))
+        log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(state),
+            len(state['followers']))
 
         if 'voter' != state['role'] and has_quorum(state) is False:
-            log('%s quorum lost. exiting..', log_prefix())
             os._exit(1)
 
     sql.rollback()
@@ -267,7 +275,7 @@ async def sync_task(db):
     state = STATE[db]
 
     while True:
-        if has_quorum(state):
+        if 'voter' != state['role']:
             return
 
         for ip, port in args.peers:
@@ -306,7 +314,7 @@ async def sync_task(db):
 
         await asyncio.sleep(1)
 
-    assert(0 == len(state['followers']))
+    assert('voter' == state['role'])
     state['following'] = (ip, port)
 
     while True:
