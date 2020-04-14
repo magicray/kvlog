@@ -113,8 +113,6 @@ async def handler(reader, writer):
     peername = writer.get_extra_info('peername')
     sockname = writer.get_extra_info('sockname')
 
-    content_length = int(headers.get('content-length', '0'))
-
     if method.lower() in ('get', 'put', 'post'):
         no_quorum = not has_quorum(state)
         not_a_leader = 'leader' != state['role']
@@ -124,16 +122,17 @@ async def handler(reader, writer):
             write_http(writer, '503 Service Unavailable', state)
             return writer.close()
 
+    content_length = int(headers.get('content-length', '0'))
+
     # PUT
     if method.lower() in ('put', 'post') and content_length:
         content = await reader.read(content_length)
         items = json.loads(content.decode())
-        for key, value in items.items():
-            key = key.encode()
-            value = json.dumps(value).encode()
 
-            sql('delete from kv where key=?', key)
-            sql('insert into kv values(null,?,?)', key, value)
+        for key, value in items.items():
+            sql('insert into kv values(null,?,?)',
+                key.encode(),
+                json.dumps(value).encode())
 
         seq = sql('select max(seq) from kv').fetchone()[0]
         sql.commit()
@@ -146,8 +145,10 @@ async def handler(reader, writer):
     if method.lower() in ('get') and 2 == len(url):
         res = dict()
         for key in [k.strip() for k in url[1].split(',')]:
-            k = key.encode()
-            row = sql('select value from kv where key=?', k).fetchone()
+            row = sql('''select value from kv
+                         where key=?
+                         order by seq desc limit 1
+                      ''', key.encode()).fetchone()
             if row:
                 res[key] = json.loads(row[0].decode())
 
@@ -167,8 +168,6 @@ async def handler(reader, writer):
 
     # SYNC
     try:
-        assert('following' not in state)
-
         peer_term, peer_seq = struct.unpack(
             '!QQ', await reader.readexactly(16))
         peer_chksum = await reader.readexactly(16)
@@ -176,41 +175,30 @@ async def handler(reader, writer):
         log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
 
         myterm, myseq = term_and_seq(sql)
-        sql.rollback()
 
-        mychksum = state['chksum']
-        if (myterm, myseq, mychksum) <= (peer_term, peer_seq, peer_chksum):
-            if len(state['followers']) < len(args.peers)/2:
-                return writer.close()
-
-        next_seq = None
+        assert((myterm, myseq, state['chksum']) >
+               (peer_term, peer_seq, peer_chksum))
 
         if myterm == peer_term:
-            next_seq = peer_seq + 1
+            next_seq = peer_seq
 
         if myterm > peer_term:
             seq = sql('''select seq from kv where key is null and seq > ?
                          order by seq limit 1
                       ''', peer_term).fetchone()[0]
 
-            if peer_seq >= seq:
-                next_seq = seq
-            else:
-                next_seq = peer_seq + 1
+            next_seq = min(seq, peer_seq)
 
-        if next_seq is None:
-            log('this should not happend - my(%d %d) peer(%d %d)',
-                myseq, myterm, peer_seq, peer_term)
-            return writer.close()
+        sql.rollback()
 
         # All good. sync can start now
+        state['followers'][peername] = 0
         writer.write(struct.pack('!Q', 0))
 
         while True:
-            cur = sql('select seq, key, value from kv where seq >= ?',
-                      next_seq)
+            cur = sql('select seq,key,value from kv where seq >= ?', next_seq)
 
-            seq, count = 0, 0
+            count = 0
             for seq, key, value in cur:
                 writer.write(struct.pack('!Q', seq))
 
@@ -229,21 +217,22 @@ async def handler(reader, writer):
 
             sql.rollback()
 
-            assert('following' not in state)
-
             writer.write(struct.pack('!Q', 0))
 
             peer_term, peer_seq = struct.unpack(
                 '!QQ', await reader.readexactly(16))
 
+            assert('following' not in state)
             state['followers'][peername] = peer_seq
+
             next_seq = peer_seq + 1
 
             if 'voter' == state['role'] and has_quorum(state):
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 if max_seq == committed_seq(state):
-                    sql('insert into kv values(null, null, null)')
+                    sql('insert into kv values(null, null, ?)', '{}:{}'.format(
+                        sockname, int(time.time()*10**9)).encode())
                     state['role'] = 'candidate'
 
                 sql.commit()
@@ -261,6 +250,7 @@ async def handler(reader, writer):
             else:
                 await asyncio.sleep(1)
     except Exception:
+        sql.rollback()
         state['followers'].pop(peername, None)
         log('%s quorum(%s)', log_prefix(), has_quorum(state))
 
@@ -268,6 +258,7 @@ async def handler(reader, writer):
             log('%s quorum lost. exiting..', log_prefix())
             os._exit(1)
 
+    sql.rollback()
     writer.close()
 
 
@@ -315,7 +306,7 @@ async def sync_task(db):
 
         await asyncio.sleep(1)
 
-    assert(has_quorum(state) is False)
+    assert(0 == len(state['followers']))
     state['following'] = (ip, port)
 
     while True:
@@ -331,9 +322,6 @@ async def sync_task(db):
             value = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
 
-            if key:
-                sql('delete from kv where key=?', key)
-
             sql('delete from kv where seq >= ?', seq)
             sql('insert into kv values(?,?,?)', seq,
                 key if key else None, value if value else None)
@@ -343,9 +331,8 @@ async def sync_task(db):
 
             count += 1
 
-        sql.commit()
-
         term, seq = term_and_seq(sql)
+        sql.commit()
 
         if count:
             log('%s term(%d) seq(%d) received(%d)',
@@ -395,10 +382,10 @@ def init():
         seq   integer primary key autoincrement,
         key   blob,
         value blob)''')
-    sql('create unique index if not exists key on kv(key)')
+    sql('create index if not exists key on kv(key)')
 
-    sql('delete from kv where seq=0')
-    sql('insert into kv values(0, null, ?)', args.password)
+    sql('delete from kv where seq=1')
+    sql('insert into kv values(1, null, ?)', args.password)
     sql.commit()
 
 
