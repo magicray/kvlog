@@ -41,9 +41,6 @@ class SQLite():
         self.rollback()
 
 
-STATE = dict()
-
-
 async def read_http(reader):
     first = await reader.readline()
 
@@ -98,20 +95,19 @@ async def handler(reader, writer):
 
     if not url:
         write_http(writer, '200 OK', {
-            k: dict(role=v['role'],
-                    committed=committed_seq(STATE[k]))
-            for k, v in STATE.items()})
+            k: committed_seq(args.state[k])
+            for k, v in args.state.items() if 'leader' == v['role']})
 
         return writer.close()
 
     url = url.split('/')
 
-    if url[0] not in STATE:
+    if url[0] not in args.state:
         write_http(writer, '404 Not Found')
         return writer.close()
 
     sql = SQLite(os.path.join('db', url[0]))
-    state = STATE[url[0]]
+    state = args.state[url[0]]
 
     peername = writer.get_extra_info('peername')
     sockname = writer.get_extra_info('sockname')
@@ -125,41 +121,83 @@ async def handler(reader, writer):
             write_http(writer, '503 Service Unavailable', state)
             return writer.close()
 
-    content_length = int(headers.get('content-length', '0'))
-
-    # PUT
-    if method.lower() in ('put', 'post') and content_length:
-        content = await reader.read(content_length)
+    # APPEND
+    if method.lower() in ('put', 'post'):
+        content = await reader.read(int(headers['content-length']))
         items = json.loads(content.decode())
 
-        for key, value in items.items():
-            sql('insert into kv values(null,?,?)',
-                key.encode(),
-                json.dumps(value).encode())
+        state['txns'][sockname] = items
+        await asyncio.sleep(1)
 
-        seq = sql('select max(seq) from kv').fetchone()[0]
+        for sname in list(state['txns'].keys()):
+            if type(state['txns'][sname]) is not list:
+                continue
+
+            for key, version, value in state['txns'][sname]:
+                if key and version:
+                    ver = sql('''select max(version) where key=?
+                              ''', key.encode()).fetchone()[0]
+
+                    if version != ver:
+                        state['txns'][sname] = dict(
+                            status='409 Conflict',
+                            content=dict(key=key, version=version,
+                                         existing_version=ver))
+                        break
+        sql.rollback()
+
+        for sname in list(state['txns'].keys()):
+            if type(state['txns'][sname]) is not list:
+                continue
+
+            for key, version, value in state['txns'][sname]:
+                sql('insert into kv values(null,?,?)',
+                    (key if key else '').encode(),
+                    json.dumps(value).encode())
+
+            state['txns'][sname] = dict(
+                status='200 OK', content=dict(keys=len(state['txns'][sname])))
+
+        commit_seq = sql('select max(seq) from kv').fetchone()[0]
         sql.commit()
 
-        write_http(writer, '200 OK', dict(keys=len(items), seq=seq))
-        log('put(%s) keys(%d) seq(%d)', url[0], len(items), seq)
+        status, content = state['txns'].pop(sockname)
+
+        if '200 OK' == status:
+            while True:
+                await asyncio.sleep(1)
+
+                term, seq = term_and_seq(sql)
+                sql.rollback()
+
+                if seq >= commit_seq:
+                    break
+
+        content.update(dict(term=term, seq=seq, commit_seq=commit_seq))
+
+        write_http(writer, status, content)
         return writer.close()
 
-    # GET
-    if method.lower() in ('get') and 2 == len(url):
-        res = dict()
+        log('put(%s) keys(%d) seq(%d)', url[0], content['keys'], commit_seq)
+
+    # READ
+    if 'get' == method.lower():
+        commit_seq = committed_seq(state)
+
+        result = dict()
         for key in [k.strip() for k in url[1].split(',')]:
-            row = sql('''select value from kv
-                         where key=?
+            row = sql('''select seq, value from kv
+                         where key=? and seq <= ?
                          order by seq desc limit 1
-                      ''', key.encode()).fetchone()
+                      ''', key.encode(), commit_seq).fetchone()
             if row:
-                res[key] = json.loads(row[0].decode())
+                result.append(key, row[0], json.loads(row[1].decode()))
 
         seq = sql('select max(seq) from kv').fetchone()[0]
         sql.rollback()
 
-        write_http(writer, '200 OK', res)
-        log('get(%s) keys(%d) seq(%d)', url[0], len(res), seq)
+        write_http(writer, '200 OK', result)
+        log('get(%s) keys(%d) seq(%d)', url[0], len(result), commit_seq)
         return writer.close()
 
     assert(method.lower() in ('sync'))
@@ -171,39 +209,76 @@ async def handler(reader, writer):
 
     # SYNC
     try:
+        # Reject any stray peer
+        if args.token != await reader.readexactly(16):
+            log('%s checksum mismatch', log_prefix())
+            return writer.close()
+
         peer_term, peer_seq = struct.unpack(
             '!QQ', await reader.readexactly(16))
         peer_chksum = await reader.readexactly(16)
 
         log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
 
-        myterm, myseq = term_and_seq(sql)
+        my_term, my_seq = term_and_seq(sql)
 
-        assert((myterm, myseq, state['chksum']) >
-               (peer_term, peer_seq, peer_chksum))
+        # If quorum already reached, accept more followers, after sanity check
+        if has_quorum(state):
+            if (my_term, my_seq) < (peer_term, peer_seq):
+                log('%s rejected as (%d %d) < (%d %d)', log_prefix(),
+                    my_term, my_seq, peer_term, peer_seq)
+                return writer.close()
 
-        if myterm == peer_term:
+        # else accept only if my (term, seq, uniq_id) is bigger than peer
+        else:
+            mystate = (my_term, my_seq, state['chksum'])
+            peerstate = (peer_term, peer_seq, peer_chksum)
+
+            # These two can never be equal due to unique checksum
+            if mystate < peerstate:
+                log('%s rejected as (%d %d id) < (%d %d id)', log_prefix(),
+                    my_term, my_seq, peer_term, peer_seq)
+                return writer.close()
+
+        # Decided to accept this follower, lets calculate common max seq
+        # If terms are equal, then my seq is guranteed to be >= to peer
+        # Just start replicating from peer seq number
+        if my_term == peer_term:
             next_seq = peer_seq
 
-        if myterm > peer_term:
+        # If my term is better then peer, decision is a little complex
+        if my_term > peer_term:
+            # seq number for term > peer term in my log
             seq = sql('''select seq from kv where key is null and seq > ?
                          order by seq limit 1
                       ''', peer_term).fetchone()[0]
 
+            # If peer has more entires than me for the term, remove them
+            # else, start from the peer_seq
             next_seq = min(seq, peer_seq)
 
         sql.rollback()
 
+        # Starting seq for replication is decided for this peer
+        # But wait till we have a quorum of followers, or
+        # sync_task() starts following someone better than us
         state['followers'][peername] = 0
-        while has_quorum(state) is False:
-            await asyncio.sleep(0.1)
+        while has_quorum(state) is False and 'following' not in state:
+            await asyncio.sleep(1)
 
-        assert('following' not in state)
+        # Reject this follower if we started following someone else
+        if 'following' in state:
+            log('%s rejected following(%s)', log_prefix(), state['following'])
+            return writer.close()
+
+        # Great. Have a quorum and not following anyone else
+        # Set the flag so that sync_task() exits
         state['role'] = 'quorum'
 
-        # All good. sync can start now
+        # Signal to the peer that it has been accepted as a follower
         writer.write(struct.pack('!Q', 0))
 
+        # And start sending the data
         while True:
             cur = sql('select seq,key,value from kv where seq >= ?', next_seq)
 
@@ -272,9 +347,10 @@ async def handler(reader, writer):
 
 async def sync_task(db):
     sql = SQLite(os.path.join('db', db))
-    state = STATE[db]
+    state = args.state[db]
 
     while True:
+        # Got a quorum of followers, no need to follow anyone else
         if 'voter' != state['role']:
             return
 
@@ -298,6 +374,7 @@ async def sync_task(db):
 
                 term, seq = term_and_seq(sql)
 
+                writer.write(args.token)
                 writer.write(struct.pack('!QQ', term, seq))
                 writer.write(state['chksum'])
 
@@ -314,7 +391,12 @@ async def sync_task(db):
 
         await asyncio.sleep(1)
 
-    assert('voter' == state['role'])
+    # Got a quorum to lead before our search for leader was successful
+    if 'voter' != state['role']:
+        return writer.close()
+
+    # Ensure that we do not try to become a leader anymore
+    # as we have found a better leader
     state['following'] = (ip, port)
 
     while True:
@@ -362,11 +444,12 @@ def server():
     for db in sorted(glob.glob('db/*.sqlite3')):
         db = '.'.join(os.path.basename(db).split('.')[:-1])
         # sql = SQLite(os.path.join('db', db))
-        state = STATE.setdefault(db, dict())
+        state = args.state.setdefault(db, dict())
 
         # cluster = sql('select value from kv where seq=0').fetchone()[0]
         # sql.rollback()
 
+        state['txns'] = dict()
         state['role'] = 'voter'
         state['followers'] = dict()
         state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
@@ -405,11 +488,14 @@ if __name__ == '__main__':
     args.add_argument('--peers', dest='peers')
     args.add_argument('--token', dest='token',
                       default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
-    args.add_argument('--timeout', dest='timeout', type=int,
-                      default=int(time.time()*10**9 % 60))
+    args.add_argument('--timeout', dest='timeout', type=int, default=60)
 
     args.add_argument('--db', dest='db')
     args.add_argument('--password', dest='password')
     args = args.parse_args()
+
+    args.state = dict()
+    args.token = hashlib.md5(args.token.encode()).digest()
+    args.timeout = int(time.time()*10**9) % min(args.timeout, 600)
 
     server() if args.port else init()
