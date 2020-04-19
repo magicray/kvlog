@@ -2,6 +2,7 @@ import os
 import json
 import glob
 import time
+import pprint
 import signal
 import struct
 import sqlite3
@@ -10,6 +11,7 @@ import hashlib
 import logging
 import argparse
 import urllib.parse
+import urllib.request
 
 from logging import critical as log
 
@@ -139,10 +141,10 @@ async def handler(reader, writer):
                               ''', key.encode()).fetchone()[0]
 
                     if version != ver:
-                        state['txns'][sname] = dict(
-                            status='409 Conflict',
-                            content=dict(key=key, version=version,
-                                         existing_version=ver))
+                        state['txns'][sname] = (
+                            '409 Conflict',
+                            dict(key=key, version=version,
+                                 existing_version=ver))
                         break
         sql.rollback()
 
@@ -155,8 +157,8 @@ async def handler(reader, writer):
                     (key if key else '').encode(),
                     json.dumps(value).encode())
 
-            state['txns'][sname] = dict(
-                status='200 OK', content=dict(keys=len(state['txns'][sname])))
+            state['txns'][sname] = (
+                '200 OK', dict(keys=len(state['txns'][sname])))
 
         commit_seq = sql('select max(seq) from kv').fetchone()[0]
         sql.commit()
@@ -184,14 +186,14 @@ async def handler(reader, writer):
     if 'get' == method.lower():
         commit_seq = committed_seq(state)
 
-        result = dict()
+        result = list()
         for key in [k.strip() for k in url[1].split(',')]:
             row = sql('''select seq, value from kv
                          where key=? and seq <= ?
                          order by seq desc limit 1
                       ''', key.encode(), commit_seq).fetchone()
             if row:
-                result.append(key, row[0], json.loads(row[1].decode()))
+                result.append((key, row[0], json.loads(row[1].decode())))
 
         seq = sql('select max(seq) from kv').fetchone()[0]
         sql.rollback()
@@ -438,9 +440,6 @@ def server():
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.start_server(handler, '', args.port))
 
-    args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
-        p.split(':') for p in args.peers.split(',')]])
-
     for db in sorted(glob.glob('db/*.sqlite3')):
         db = '.'.join(os.path.basename(db).split('.')[:-1])
         # sql = SQLite(os.path.join('db', db))
@@ -480,6 +479,49 @@ def init():
     sql.commit()
 
 
+class Client():
+    def __init__(self, servers):
+        self.servers = servers
+        self.leaders = None
+
+    def leader(self, db=None):
+        if self.leaders is None:
+            result = dict()
+
+            for ip, port in self.servers:
+                url = 'http://{}:{}'.format(ip, port)
+
+                try:
+                    with urllib.request.urlopen(url) as r:
+                        for k, v in json.loads(r.read()).items():
+                            result[k] = dict(seq=v, url=url + '/{}'.format(k))
+                except Exception:
+                    pass
+
+            self.leaders = result
+
+        return self.leaders.get(db, None)
+
+    def put(self, db, filename):
+        leader_url = self.leader(db)['url']
+
+        with open(filename, 'rb') as f:
+            data = f.read()
+
+        req = urllib.request.Request(leader_url, data=data, method='PUT')
+
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+
+    def get(self, db, keys):
+        leader_url = self.leader(db)['url']
+
+        url = '{}/{}'.format(leader_url, ','.join(keys))
+
+        with urllib.request.urlopen(url) as r:
+            return json.loads(r.read())
+
+
 if __name__ == '__main__':
     # openssl req -x509 -nodes -subj / -sha256 --keyout ssl.key --out ssl.cert
 
@@ -492,10 +534,34 @@ if __name__ == '__main__':
 
     args.add_argument('--db', dest='db')
     args.add_argument('--password', dest='password')
+
+    args.add_argument('--get', dest='get')
+    args.add_argument('--put', dest='put')
     args = args.parse_args()
 
     args.state = dict()
     args.token = hashlib.md5(args.token.encode()).digest()
     args.timeout = int(time.time()*10**9) % min(args.timeout, 600)
 
-    server() if args.port else init()
+    args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
+        p.split(':') for p in args.peers.split(',') if p]])
+
+    client = Client(args.peers)
+
+    if args.port:
+        server()
+    elif args.get:
+        log('Fetching : {}'.format(client.leader(args.db)))
+
+        result = client.get(args.db, args.get.split(','))
+        for key, version, value in result:
+            print('{} {} {}'.format(key, version, value))
+    elif args.put:
+        log('Updating : {}'.format(client.leader(args.db)))
+
+        print(client.put(args.db, args.put))
+    elif args.db:
+        init()
+    else:
+        client.leader()
+        pprint.pprint(client.leaders)
