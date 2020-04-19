@@ -105,7 +105,7 @@ async def handler(reader, writer):
     url = url.split('/')
 
     if url[0] not in args.state:
-        write_http(writer, '404 Not Found')
+        write_http(writer, '404 Not Found', 'DB({}) not found'.format(url[0]))
         return writer.close()
 
     sql = SQLite(os.path.join('db', url[0]))
@@ -126,61 +126,73 @@ async def handler(reader, writer):
     # APPEND
     if method.lower() in ('put', 'post'):
         content = await reader.read(int(headers['content-length']))
-        items = json.loads(content.decode())
+        state['txns'][sockname] = json.loads(content.decode())
 
-        state['txns'][sockname] = items
+        # Lets wait for enough requests so that we can commit a batch
         await asyncio.sleep(1)
 
-        for sname in list(state['txns'].keys()):
-            if type(state['txns'][sname]) is not list:
+        keyset = set()
+        sql_flag = False
+        for sock in state['txns']:
+            if type(state['txns'][sock]) is not list:
                 continue
 
-            for key, version, value in state['txns'][sname]:
-                if key and version:
-                    ver = sql('''select max(version) where key=?
+            for key, version, value in state['txns'][sock]:
+                conflict = None
+
+                if key in keyset:
+                    conflict = dict(key=key, seq=version)
+
+                elif key and version:
+                    seq = sql('''select max(version) where key=?
                               ''', key.encode()).fetchone()[0]
 
-                    if version != ver:
-                        state['txns'][sname] = (
-                            '409 Conflict',
-                            dict(key=key, version=version,
-                                 existing_version=ver))
-                        break
-        sql.rollback()
+                    sql_flag = True
+                    if version != seq:
+                        conflict = dict(key=key, seq=seq, existing_seq=seq)
 
-        for sname in list(state['txns'].keys()):
-            if type(state['txns'][sname]) is not list:
+                if conflict:
+                    state['txns'][sock] = ('409 Conflict', conflict)
+                    break
+
+                if key:
+                    keyset.add(key)
+
+        for sock in state['txns']:
+            if type(state['txns'][sock]) is not list:
                 continue
 
-            for key, version, value in state['txns'][sname]:
+            for key, version, value in state['txns'][sock]:
+                if not key:
+                    key = '{}:{}'.format(sockname, int(time.time()*10**9))
+
+                sql_flag = True
                 sql('insert into kv values(null,?,?)',
-                    (key if key else '').encode(),
+                    key.encode(),
                     json.dumps(value).encode())
 
-            state['txns'][sname] = (
-                '200 OK', dict(keys=len(state['txns'][sname])))
+            state['txns'][sock] = (
+                '200 OK', dict(keys=len(state['txns'][sock])))
 
-        commit_seq = sql('select max(seq) from kv').fetchone()[0]
-        sql.commit()
+        if sql_flag:
+            term, seq = term_and_seq(sql)
+            sql.commit()
+
+            for sock in state['txns']:
+                if type(state['txns'][sock]) is tuple:
+                    state['txns'][sock][1].update(dict(
+                        commit_term=term, commit_seq=seq))
 
         status, content = state['txns'].pop(sockname)
 
         if '200 OK' == status:
-            while True:
+            while content['commit_seq'] < committed_seq(state):
                 await asyncio.sleep(1)
 
-                term, seq = term_and_seq(sql)
-                sql.rollback()
-
-                if seq >= commit_seq:
-                    break
-
-        content.update(dict(term=term, seq=seq, commit_seq=commit_seq))
-
         write_http(writer, status, content)
-        return writer.close()
+        log('put(%s) status(%s) content(%s)', url[0], status, str(content))
 
-        log('put(%s) keys(%d) seq(%d)', url[0], content['keys'], commit_seq)
+        return writer.close()
 
     # READ
     if 'get' == method.lower():
@@ -195,11 +207,10 @@ async def handler(reader, writer):
             if row:
                 result.append((key, row[0], json.loads(row[1].decode())))
 
-        seq = sql('select max(seq) from kv').fetchone()[0]
         sql.rollback()
 
         write_http(writer, '200 OK', result)
-        log('get(%s) keys(%d) seq(%d)', url[0], len(result), commit_seq)
+        log('get(%s) keys(%d) commit_seq(%d)', url[0], len(result), commit_seq)
         return writer.close()
 
     assert(method.lower() in ('sync'))
