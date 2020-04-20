@@ -64,26 +64,45 @@ def write_http(writer, status, obj=None):
 
 
 def quorum(state):
+    # Peers are the servers, other than this, in the cluster.
+    # To be a leader, we want at least half of the peers to follow.
+    # 1 peers -> 1 follower,  2 peers -> 1 follower
+    # 3 peers -> 2 followers, 4 peers -> 2 followers
+
+    # This number + leader is a majority
     return int((len(args.peers) + 1) / 2)
 
 
 def has_quorum(state):
+    # We are good to go if we already got sync requests from a quorum or more
     return len(state['followers']) >= quorum(state)
 
 
 def committed_seq(state):
+    # It is pointless till we have a quorum
     if not has_quorum(state):
         return 0
 
+    # If this node is a leader, it's max(seq) is guranteed to be biggest
     commits = sorted(list(state['followers'].values()), reverse=True)
 
     return commits[quorum(state) - 1]
 
 
 def term_and_seq(sql):
+    # Obviously, the biggest seq number
     seq = sql('select max(seq) from kv').fetchone()[0]
+
+    # A new term starts when a candidate, after getting a quroum, inserts
+    # a row with null key in the log. The seq for this row is the new term.
+    #
+    # This is the most critical step in the leader election process. A quorum
+    # of followers must replicate this row in their logs to enable this
+    # candidate to declare itself the leader for this new term.
     term = sql('''select seq from kv
-                  where key is null order by seq desc limit 1
+                  where key is null
+                  order by seq desc
+                  limit 1
                ''').fetchone()[0]
 
     return term, seq
@@ -95,6 +114,7 @@ async def handler(reader, writer):
 
     url = url.strip('/')
 
+    # Current leader for each db managed by this cluster
     if not url:
         write_http(writer, '200 OK', {
             k: committed_seq(args.state[k])
@@ -102,6 +122,7 @@ async def handler(reader, writer):
 
         return writer.close()
 
+    # db, keys, version = url[0], url[1], url[2]
     url = url.split('/')
 
     if url[0] not in args.state:
@@ -114,6 +135,7 @@ async def handler(reader, writer):
     peername = writer.get_extra_info('peername')
     sockname = writer.get_extra_info('sockname')
 
+    # Don't read/write until elected leader or lost quorum
     if method.lower() in ('get', 'put', 'post'):
         no_quorum = not has_quorum(state)
         not_a_leader = 'leader' != state['role']
@@ -131,50 +153,56 @@ async def handler(reader, writer):
         # Lets wait for enough requests so that we can commit a batch
         await asyncio.sleep(1)
 
-        keyset = set()
-        sql_flag = False
-        for sock in state['txns']:
-            if type(state['txns'][sock]) is not list:
-                continue
+        # No one else has processed this batch in last one second
+        if type(state['txns'][sockname]) is list:
+            keyset = set()
 
-            for key, version, value in state['txns'][sock]:
-                conflict = None
+            # Check for conflicting requests, to be rejected
+            for sock in state['txns']:
+                if type(state['txns'][sock]) is not list:
+                    continue
 
-                if key in keyset:
-                    conflict = dict(key=key, seq=version)
+                for key, version, value in state['txns'][sock]:
+                    conflict = None
 
-                elif key and version:
-                    seq = sql('''select max(version) where key=?
-                              ''', key.encode()).fetchone()[0]
+                    # Another requests already proposed an update to thie key
+                    if key in keyset:
+                        conflict = dict(key=key, seq=version)
 
-                    sql_flag = True
-                    if version != seq:
-                        conflict = dict(key=key, seq=seq, existing_seq=seq)
+                    # A request with optimistic locking - check if all ok
+                    elif key and version:
+                        seq = sql('''select max(version) where key=?
+                                  ''', key.encode()).fetchone()[0]
 
-                if conflict:
-                    state['txns'][sock] = ('409 Conflict', conflict)
-                    break
+                        # Conflict as version already updated
+                        if version != seq:
+                            conflict = dict(key=key, seq=seq, existing_seq=seq)
 
-                if key:
-                    keyset.add(key)
+                    if conflict:
+                        state['txns'][sock] = ('409 Conflict', conflict)
+                        break
 
-        for sock in state['txns']:
-            if type(state['txns'][sock]) is not list:
-                continue
+                    # Conflict free so far. To be rejected if seen again
+                    if key:
+                        keyset.add(key)
 
-            for key, version, value in state['txns'][sock]:
-                if not key:
-                    key = '{}:{}'.format(sockname, int(time.time()*10**9))
+            # Only conflict free keys remaining. Let's append them to log
+            for sock in state['txns']:
+                if type(state['txns'][sock]) is not list:
+                    continue
 
-                sql_flag = True
-                sql('insert into kv values(null,?,?)',
-                    key.encode(),
-                    json.dumps(value).encode())
+                for key, version, value in state['txns'][sock]:
+                    # In case of null key, generate a unique key
+                    if not key:
+                        key = '{}:{}'.format(sockname, int(time.time()*10**9))
 
-            state['txns'][sock] = (
-                '200 OK', dict(keys=len(state['txns'][sock])))
+                    sql('insert into kv values(null,?,?)',
+                        key.encode(),
+                        json.dumps(value).encode())
 
-        if sql_flag:
+                state['txns'][sock] = (
+                    '200 OK', dict(keys=len(state['txns'][sock])))
+
             term, seq = term_and_seq(sql)
             sql.commit()
 
@@ -183,12 +211,16 @@ async def handler(reader, writer):
                     state['txns'][sock][1].update(dict(
                         commit_term=term, commit_seq=seq))
 
+        # Someone has committed this batch by now. Lets examine the result.
         status, content = state['txns'].pop(sockname)
 
+        # Great - our request was not rejected due to a conflict.
+        # Let's wait till a quorum replicates the data in their logs
         if '200 OK' == status:
             while content['commit_seq'] < committed_seq(state):
                 await asyncio.sleep(1)
 
+        # Request was either rejected or committed on a mojority of servers
         write_http(writer, status, content)
         log('put(%s) status(%s) content(%s)', url[0], status, str(content))
 
@@ -196,6 +228,7 @@ async def handler(reader, writer):
 
     # READ
     if 'get' == method.lower():
+        # Must not return data that is not replicated by a quorum
         commit_seq = committed_seq(state)
 
         result = list()
@@ -220,7 +253,7 @@ async def handler(reader, writer):
         return 'master({}) slave({}) role({}) db({})'.format(
             sockname[i], peername[i], state['role'], url[0])
 
-    # SYNC
+    # SYNC - That's why this project exists
     try:
         # Reject any stray peer
         if args.token != await reader.readexactly(16):
@@ -274,7 +307,7 @@ async def handler(reader, writer):
 
         # Starting seq for replication is decided for this peer
         # But wait till we have a quorum of followers, or
-        # sync_task() starts following someone better than us
+        # sync() starts following someone better than us
         state['followers'][peername] = 0
         while has_quorum(state) is False and 'following' not in state:
             await asyncio.sleep(1)
@@ -285,7 +318,7 @@ async def handler(reader, writer):
             return writer.close()
 
         # Great. Have a quorum and not following anyone else
-        # Set the flag so that sync_task() exits
+        # Set the flag so that sync() exits
         state['role'] = 'quorum'
 
         # Signal to the peer that it has been accepted as a follower
@@ -358,7 +391,7 @@ async def handler(reader, writer):
     writer.close()
 
 
-async def sync_task(db):
+async def sync(db):
     sql = SQLite(os.path.join('db', db))
     state = args.state[db]
 
@@ -385,6 +418,8 @@ async def sync_task(db):
             try:
                 writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
 
+                # Tell the leader our current state.
+                # Leader would decide the starting point of replication for us.
                 term, seq = term_and_seq(sql)
 
                 writer.write(args.token)
@@ -425,7 +460,11 @@ async def sync_task(db):
             value = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
 
+            # Delete any redundant entries earlier leader might have
+            # This should be done only once - optimization TBD
             sql('delete from kv where seq >= ?', seq)
+
+            # Replicate the entry we got from the leader
             sql('insert into kv values(?,?,?)', seq,
                 key if key else None, value if value else None)
 
@@ -441,6 +480,7 @@ async def sync_task(db):
             log('%s term(%d) seq(%d) received(%d)',
                 log_prefix, term, seq, count)
 
+        # Inform the leader that we committed till seq and ask for more
         writer.write(struct.pack('!QQ', term, seq))
 
 
@@ -464,7 +504,7 @@ def server():
         state['followers'] = dict()
         state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
 
-        asyncio.ensure_future(sync_task(db))
+        asyncio.ensure_future(sync(db))
 
     def exception_handler(loop, context):
         log(context['future'])
@@ -479,12 +519,27 @@ def init():
         os.mkdir('db')
 
     sql = SQLite(os.path.join('db', args.db))
+
+    # Simplest possible schema for a versioned key/value store
+    # Rows are never updated. seq would increment with each insert.
+    #
+    # Null key indicates a new leader is taking over and start of a new term.
+    # All the values till next null key are coordinated by this leader.
+    # It is mandatory for a new leader to insert a new row with a null key to
+    # establish its leaership. seq at this null key is the term number.
+    #
+    # There would be multiple rows with the same key. The row with the max
+    # seq less than the committed sequence is the value returned by read.
+    #
+    # Committed sequence number is the max seq reported by a quorum.
     sql('''create table if not exists kv(
         seq   integer primary key autoincrement,
         key   blob,
         value blob)''')
     sql('create index if not exists key on kv(key)')
 
+    # seq = 1, must always be present for initial election to start
+    # It is utilized for storing configuration data for this db
     sql('delete from kv where seq=1')
     sql('insert into kv values(1, null, ?)', args.password)
     sql.commit()
