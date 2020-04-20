@@ -319,6 +319,8 @@ async def handler(reader, writer):
 
         # Great. Have a quorum and not following anyone else
         # Set the flag so that sync() exits
+        #
+        # Leader election - step 1 of 3
         state['role'] = 'quorum'
 
         # Signal to the peer that it has been accepted as a follower
@@ -328,7 +330,7 @@ async def handler(reader, writer):
         while True:
             cur = sql('select seq,key,value from kv where seq >= ?', next_seq)
 
-            count = 0
+            rows_sent = 0
             for seq, key, value in cur:
                 writer.write(struct.pack('!Q', seq))
 
@@ -343,7 +345,7 @@ async def handler(reader, writer):
                 log('%s seq(%d) key(%d) value(%d)',
                     log_prefix(), seq, len(key), len(value))
 
-                count += 1
+                rows_sent += 1
 
             sql.rollback()
 
@@ -356,27 +358,47 @@ async def handler(reader, writer):
 
             next_seq = peer_seq + 1
 
+            # Wait for a quorum to fully replicate its log. Then insert a row
+            # with null key to declare its candidature for leadership. The
+            # seq for this row is the term number during new leaders reign.
+            #
+            # Leader election - step 2 of 3
             if 'quorum' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
+                # Quorum is in sync with its logs
                 if max_seq == committed_seq(state):
                     sql('insert into kv values(null, null, ?)', '{}:{}'.format(
                         sockname, int(time.time()*10**9)).encode())
-                    state['role'] = 'candidate'
 
-                sql.commit()
-            elif 'candidate' == state['role']:
+                    state['role'] = 'candidate'
+                    sql.commit()
+                    continue
+
+                sql.rollback()
+
+            # Wait for a quorum to fully replicate its log, including the row
+            # with null key, declaring the candidature of the new leader.
+            # Since a quorum has accepted this new row and the logs are in sync
+            # There is no backing off. Its safe to accept update requests.
+            #
+            # Leader is elected for the new term. WooHoo.
+            #
+            # Leader election - step 3 of 3
+            if 'candidate' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
+                # Quorum is in sync with its logs
                 if max_seq == committed_seq(state):
                     state['role'] = 'leader'
 
                 sql.rollback()
 
-            if count or 'candidate' == state['role']:
+            if rows_sent > 0:
                 log('%s term(%d) seq(%d) sent(%d)',
-                    log_prefix(), peer_term, peer_seq, count)
+                    log_prefix(), peer_term, peer_seq, rows_sent)
             else:
+                # Avoid a busy loop when there is no data to send
                 await asyncio.sleep(1)
     except Exception:
         sql.rollback()
@@ -384,6 +406,8 @@ async def handler(reader, writer):
         log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(state),
             len(state['followers']))
 
+        # Had a quorum once but not anymore. Too many complex cases to handle.
+        # Its safer to exit and start from a clean slate.
         if 'voter' != state['role'] and has_quorum(state) is False:
             os._exit(1)
 
@@ -448,7 +472,7 @@ async def sync(db):
     state['following'] = (ip, port)
 
     while True:
-        count = 0
+        rows_received = 0
         while True:
             seq = struct.unpack('!Q', await reader.readexactly(8))[0]
 
@@ -460,8 +484,8 @@ async def sync(db):
             value = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
 
-            # Delete any redundant entries earlier leader might have
-            # This should be done only once - optimization TBD
+            # Delete any redundant entries earlier leader might have.
+            # This should be done only once - optimization - some day.
             sql('delete from kv where seq >= ?', seq)
 
             # Replicate the entry we got from the leader
@@ -471,14 +495,14 @@ async def sync(db):
             log('%s seq(%d) key(%d) value(%d)',
                 log_prefix, seq, len(key), len(value))
 
-            count += 1
+            rows_received += 1
 
         term, seq = term_and_seq(sql)
         sql.commit()
 
-        if count:
+        if rows_received:
             log('%s term(%d) seq(%d) received(%d)',
-                log_prefix, term, seq, count)
+                log_prefix, term, seq, rows_received)
 
         # Inform the leader that we committed till seq and ask for more
         writer.write(struct.pack('!QQ', term, seq))
