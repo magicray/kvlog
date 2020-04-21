@@ -59,8 +59,8 @@ async def read_http(reader):
 
 def write_http(writer, status, obj=None):
     writer.write('HTTP/1.0 {}\n\n'.format(status).encode())
-    writer.write(
-        json.dumps(obj if obj else status, indent=4, sort_keys=True).encode())
+    writer.write(json.dumps(status if obj is None else obj,
+                            indent=4, sort_keys=True).encode())
 
 
 def quorum(state):
@@ -171,7 +171,7 @@ async def handler(reader, writer):
 
                     # A request with optimistic locking - check if all ok
                     elif key and version:
-                        seq = sql('''select max(version) where key=?
+                        seq = sql('''select max(seq) from kv where key=?
                                   ''', key.encode()).fetchone()[0]
 
                         # Conflict as version already updated
@@ -186,12 +186,12 @@ async def handler(reader, writer):
                     if key:
                         keyset.add(key)
 
-            # Only conflict free keys remaining. Let's append them to log
+            # Only non conflicting keys remaining. Let's append them to log
             for sock in state['txns']:
                 if type(state['txns'][sock]) is not list:
                     continue
 
-                for key, version, value in state['txns'][sock]:
+                for key, _, value in state['txns'][sock]:
                     # In case of null key, generate a unique key
                     if not key:
                         key = '{}:{}'.format(sockname, int(time.time()*10**9))
@@ -203,8 +203,10 @@ async def handler(reader, writer):
                 state['txns'][sock] = (
                     '200 OK', dict(keys=len(state['txns'][sock])))
 
-            term, seq = term_and_seq(sql)
             sql.commit()
+
+            term, seq = term_and_seq(sql)
+            sql.rollback()
 
             for sock in state['txns']:
                 if type(state['txns'][sock]) is tuple:
@@ -267,6 +269,7 @@ async def handler(reader, writer):
         log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
 
         my_term, my_seq = term_and_seq(sql)
+        sql.rollback()
 
         # If quorum already reached, accept more followers, after sanity check
         if has_quorum(state):
@@ -287,23 +290,20 @@ async def handler(reader, writer):
                 return writer.close()
 
         # Decided to accept this follower, lets calculate common max seq
-        # If terms are equal, then my seq is guranteed to be >= to peer
-        # Just start replicating from peer seq number
+        # This is always correct. Even though inefficient.
+        # When a peer is a couple of terms behind, its ok if it gets a little
+        # redundant data, as it is not a common case.
+        next_seq = peer_term
+
+        # But every time, a quorum would have same last term, after the current
+        # leader crashes or exits. Let's try to optimize this frequent case
+        # by not sending all the data from the last term again.
+        # We know that an entry can not be present in the log if the previous
+        # one was incorrect, lets just start from the last entry the peer has
+        # Only one redundant row in this case, but still avoids lots of complex
+        # case we need to consider otherwise.
         if my_term == peer_term:
             next_seq = peer_seq
-
-        # If my term is better then peer, decision is a little complex
-        if my_term > peer_term:
-            # seq number for term > peer term in my log
-            seq = sql('''select seq from kv where key is null and seq > ?
-                         order by seq limit 1
-                      ''', peer_term).fetchone()[0]
-
-            # If peer has more entires than me for the term, remove them
-            # else, start from the peer_seq
-            next_seq = min(seq, peer_seq)
-
-        sql.rollback()
 
         # Starting seq for replication is decided for this peer
         # But wait till we have a quorum of followers, or
@@ -328,7 +328,9 @@ async def handler(reader, writer):
 
         # And start sending the data
         while True:
-            cur = sql('select seq,key,value from kv where seq >= ?', next_seq)
+            cur = sql('''select seq, key, value from kv
+                         where seq >= ? order by seq
+                      ''', next_seq)
 
             rows_sent = 0
             for seq, key, value in cur:
@@ -497,8 +499,9 @@ async def sync(db):
 
             rows_received += 1
 
-        term, seq = term_and_seq(sql)
         sql.commit()
+
+        term, seq = term_and_seq(sql)
 
         if rows_received:
             log('%s term(%d) seq(%d) received(%d)',
@@ -633,8 +636,9 @@ if __name__ == '__main__':
     args.token = hashlib.md5(args.token.encode()).digest()
     args.timeout = int(time.time()*10**9) % min(args.timeout, 600)
 
-    args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
-        p.split(':') for p in args.peers.split(',') if p]])
+    if args.peers:
+        args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
+            p.split(':') for p in args.peers.split(',')]])
 
     client = Client(args.peers)
 
