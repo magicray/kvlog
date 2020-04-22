@@ -59,8 +59,15 @@ async def read_http(reader):
 
 def write_http(writer, status, obj=None):
     writer.write('HTTP/1.0 {}\n\n'.format(status).encode())
-    writer.write(json.dumps(status if obj is None else obj,
-                            indent=4, sort_keys=True).encode())
+
+    if type(obj) is bytes:
+        content = obj
+    elif obj:
+        content = json.dumps(obj, indent=4, sort_keys=True).encode()
+    else:
+        content = status.encode()
+
+    writer.write(content)
 
 
 def quorum(state):
@@ -122,7 +129,6 @@ async def handler(reader, writer):
 
         return writer.close()
 
-    # db, keys, version = url[0], url[1], url[2]
     url = url.split('/')
 
     if url[0] not in args.state:
@@ -151,11 +157,12 @@ async def handler(reader, writer):
         state['txns'][sockname] = json.loads(content.decode())
 
         # Lets wait for enough requests so that we can commit a batch
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
 
         # No one else has processed this batch in last one second
         if type(state['txns'][sockname]) is list:
-            keyset = set()
+            # Invalid and conflicting keys would be rejected
+            keyset = set([None, ''])
 
             # Check for conflicting requests, to be rejected
             for sock in state['txns']:
@@ -167,7 +174,8 @@ async def handler(reader, writer):
 
                     # Another requests already proposed an update to thie key
                     if key in keyset:
-                        conflict = dict(key=key, seq=version)
+                        conflict = dict(status='conflict',
+                                        key=key, seq=version)
 
                     # A request with optimistic locking - check if all ok
                     elif key and version:
@@ -176,10 +184,12 @@ async def handler(reader, writer):
 
                         # Conflict as version already updated
                         if version != seq:
-                            conflict = dict(key=key, seq=seq, existing_seq=seq)
+                            conflict = dict(status='mismatch',
+                                            key=key, seq=version,
+                                            existing_seq=seq)
 
                     if conflict:
-                        state['txns'][sock] = ('409 Conflict', conflict)
+                        state['txns'][sock] = conflict
                         break
 
                     # Conflict free so far. To be rejected if seen again
@@ -191,17 +201,13 @@ async def handler(reader, writer):
                 if type(state['txns'][sock]) is not list:
                     continue
 
-                for key, _, value in state['txns'][sock]:
-                    # In case of null key, generate a unique key
-                    if not key:
-                        key = '{}:{}'.format(sockname, int(time.time()*10**9))
-
+                for key, version, value in state['txns'][sock]:
                     sql('insert into kv values(null,?,?)',
                         key.encode(),
                         json.dumps(value).encode())
 
-                state['txns'][sock] = (
-                    '200 OK', dict(keys=len(state['txns'][sock])))
+                state['txns'][sock] = dict(status='ok',
+                                           keys=len(state['txns'][sock]))
 
             sql.commit()
 
@@ -209,32 +215,39 @@ async def handler(reader, writer):
             sql.rollback()
 
             for sock in state['txns']:
-                if type(state['txns'][sock]) is tuple:
-                    state['txns'][sock][1].update(dict(
-                        commit_term=term, commit_seq=seq))
+                state['txns'][sock]['txn_seq'] = seq
 
         # Someone has committed this batch by now. Lets examine the result.
-        status, content = state['txns'].pop(sockname)
+        result = state['txns'].pop(sockname)
 
         # Great - our request was not rejected due to a conflict.
         # Let's wait till a quorum replicates the data in their logs
-        if '200 OK' == status:
-            while content['commit_seq'] < committed_seq(state):
-                await asyncio.sleep(1)
+        if 'ok' == result['status']:
+            while result['txn_seq'] < committed_seq(state):
+                await asyncio.sleep(0.1)
 
-        # Request was either rejected or committed on a mojority of servers
-        write_http(writer, status, content)
-        log('put(%s) status(%s) content(%s)', url[0], status, str(content))
+        result['committed_seq'] = committed_seq(state)
+
+        write_http(writer, '200 OK', result)
+        log('put(%s) content(%s)', url[0], str(result))
 
         return writer.close()
 
     # READ
     if 'get' == method.lower():
+        cmd = url[1]
+
+        if 'keys' == cmd:
+            keys = [k.strip() for k in url[2].split(',')]
+
+        if cmd in ('key', 'static'):
+            keys = [url[2].strip()]
+
         # Must not return data that is not replicated by a quorum
         commit_seq = committed_seq(state)
 
         result = list()
-        for key in [k.strip() for k in url[1].split(',')]:
+        for key in keys:
             row = sql('''select seq, value from kv
                          where key=? and seq <= ?
                          order by seq desc limit 1
@@ -244,7 +257,12 @@ async def handler(reader, writer):
 
         sql.rollback()
 
-        write_http(writer, '200 OK', result)
+        if 'keys' == cmd:
+            write_http(writer, '200 OK', result)
+
+        if cmd in ('key', 'static'):
+            write_http(writer, '200 OK', result[0][2] if result else b'')
+
         log('get(%s) keys(%d) commit_seq(%d)', url[0], len(result), commit_seq)
         return writer.close()
 
@@ -310,7 +328,7 @@ async def handler(reader, writer):
         # sync() starts following someone better than us
         state['followers'][peername] = 0
         while has_quorum(state) is False and 'following' not in state:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
         # Reject this follower if we started following someone else
         if 'following' in state:
@@ -399,9 +417,9 @@ async def handler(reader, writer):
             if rows_sent > 0:
                 log('%s term(%d) seq(%d) sent(%d)',
                     log_prefix(), peer_term, peer_seq, rows_sent)
-            else:
-                # Avoid a busy loop when there is no data to send
-                await asyncio.sleep(1)
+
+            # Avoid a busy loop
+            await asyncio.sleep(0.1)
     except Exception:
         sql.rollback()
         state['followers'].pop(peername, None)
@@ -463,7 +481,7 @@ async def sync(db):
         if reader:
             break
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
 
     # Got a quorum to lead before our search for leader was successful
     if 'voter' != state['role']:
@@ -575,10 +593,10 @@ def init():
 class Client():
     def __init__(self, servers):
         self.servers = servers
-        self.leaders = None
+        self.leaders = dict()
 
     def leader(self, db=None):
-        if self.leaders is None:
+        if db not in self.leaders:
             result = dict()
 
             for ip, port in self.servers:
@@ -596,23 +614,41 @@ class Client():
         return self.leaders.get(db, None)
 
     def put(self, db, filename):
-        leader_url = self.leader(db)['url']
-
         with open(filename, 'rb') as f:
             data = f.read()
 
-        req = urllib.request.Request(leader_url, data=data, method='PUT')
+        for i in range(10):
+            try:
+                req = urllib.request.Request(
+                    self.leader(db)['url'], data=data, method='PUT')
 
-        with urllib.request.urlopen(req) as r:
-            return json.loads(r.read())
+                with urllib.request.urlopen(req) as r:
+                    return json.loads(r.read())
+            except Exception:
+                self.leaders = None
+                time.sleep(2)
 
-    def get(self, db, keys):
-        leader_url = self.leader(db)['url']
+    def key(self, db, key):
+        for i in range(10):
+            try:
+                url = '{}/key/{}'.format(self.leader(db)['url'], key)
 
-        url = '{}/{}'.format(leader_url, ','.join(keys))
+                with urllib.request.urlopen(url) as r:
+                    return r.read()
+            except Exception:
+                self.leaders = None
+                time.sleep(2)
 
-        with urllib.request.urlopen(url) as r:
-            return json.loads(r.read())
+    def keys(self, db, keys):
+        for i in range(10):
+            try:
+                url = '{}/keys/{}'.format(self.leader(db)['url'],
+                                          ','.join(keys))
+                with urllib.request.urlopen(url) as r:
+                    return json.loads(r.read())
+            except Exception:
+                self.leaders = None
+                time.sleep(2)
 
 
 if __name__ == '__main__':
@@ -625,10 +661,11 @@ if __name__ == '__main__':
                       default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
     args.add_argument('--timeout', dest='timeout', type=int, default=60)
 
-    args.add_argument('--db', dest='db')
+    args.add_argument('--init', dest='db')
     args.add_argument('--password', dest='password')
 
-    args.add_argument('--get', dest='get')
+    args.add_argument('--key', dest='key')
+    args.add_argument('--keys', dest='keys')
     args.add_argument('--put', dest='put')
     args = args.parse_args()
 
@@ -644,18 +681,24 @@ if __name__ == '__main__':
 
     if args.port:
         server()
-    elif args.get:
-        log('Fetching : {}'.format(client.leader(args.db)))
-
-        result = client.get(args.db, args.get.split(','))
-        for key, version, value in result:
-            print('{} {} {}'.format(key, version, value))
-    elif args.put:
-        log('Updating : {}'.format(client.leader(args.db)))
-
-        print(client.put(args.db, args.put))
     elif args.db:
         init()
+    elif args.key:
+        db, key = args.key.split('/')
+        log('Fetching : {}'.format(client.leader(db)))
+
+        print(client.key(db, key))
+    elif args.keys:
+        db, keys = args.keys.split('/')
+        log('Fetching : {}'.format(client.leader(db)))
+
+        for key, version, value in client.keys(db, keys.split(',')):
+            print('{} {} {}'.format(key, version, value))
+    elif args.put:
+        db, filename = args.put.split('/')
+        log('Updating : {}'.format(client.leader(db)))
+
+        pprint.pprint(client.put(db, filename))
     else:
         client.leader()
         pprint.pprint(client.leaders)
