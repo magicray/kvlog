@@ -57,15 +57,13 @@ async def read_http(reader):
     return urllib.parse.unquote(first.decode()), headers
 
 
-def write_http(writer, status, obj=None):
-    writer.write('HTTP/1.0 {}\n\n'.format(status).encode())
-
-    if type(obj) is bytes:
-        content = obj
-    elif obj:
+def write_http(writer, status, obj=b''):
+    content = obj
+    if type(obj) is not bytes:
         content = json.dumps(obj, indent=4, sort_keys=True).encode()
-    else:
-        content = status.encode()
+
+    writer.write('HTTP/1.0 {}\nContent-Length: {}\n\n'.format(
+        status, len(content)).encode())
 
     writer.write(content)
 
@@ -659,7 +657,7 @@ if __name__ == '__main__':
     args.add_argument('--peers', dest='peers')
     args.add_argument('--token', dest='token',
                       default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
-    args.add_argument('--timeout', dest='timeout', type=int, default=60)
+    args.add_argument('--timeout', dest='timeout', type=int, default=15)
 
     args.add_argument('--init', dest='db')
     args.add_argument('--password', dest='password')
