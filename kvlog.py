@@ -3,7 +3,6 @@ import json
 import glob
 import time
 import pprint
-import signal
 import struct
 import sqlite3
 import asyncio
@@ -267,7 +266,7 @@ async def handler(reader, writer):
     assert(method.lower() in ('sync'))
 
     def log_prefix():
-        i = 1 if '127.0.0.1' == sockname[0] else 0
+        i = 1 if sockname[0] in ('127.0.0.1', '::1') else 0
         return 'master({}) slave({}) role({}) db({})'.format(
             sockname[i], peername[i], state['role'], url[0])
 
@@ -453,8 +452,8 @@ async def sync(db):
                 continue
 
             log_prefix = 'slave({}) master({}) db({})'.format(
-                sockname[1 if '127.0.0.1' == sockname[0] else 0],
-                peername[1 if '127.0.0.1' == peername[0] else 0],
+                sockname[1 if sockname[0] in ('127.0.0.1', '::1') else 0],
+                peername[1 if peername[0] in ('127.0.0.1', '::1') else 0],
                 db)
 
             try:
@@ -527,12 +526,23 @@ async def sync(db):
         writer.write(struct.pack('!QQ', term, seq))
 
 
+async def timekeeper():
+    start = time.time()
+    timeout = time.time()*10**9 % 10
+
+    while time.time() < start + timeout:
+        await asyncio.sleep(1)
+
+    os._exit(1)
+
+
 def server():
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-    signal.alarm(args.timeout)
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.start_server(handler, '', args.port))
+
+    asyncio.ensure_future(timekeeper())
 
     for db in sorted(glob.glob('db/*.sqlite3')):
         db = '.'.join(os.path.basename(db).split('.')[:-1])
@@ -657,7 +667,6 @@ if __name__ == '__main__':
     args.add_argument('--peers', dest='peers')
     args.add_argument('--token', dest='token',
                       default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
-    args.add_argument('--timeout', dest='timeout', type=int, default=15)
 
     args.add_argument('--init', dest='db')
     args.add_argument('--password', dest='password')
@@ -669,7 +678,6 @@ if __name__ == '__main__':
 
     args.state = dict()
     args.token = hashlib.md5(args.token.encode()).digest()
-    args.timeout = int(time.time()*10**9) % min(args.timeout, 600)
 
     if args.peers:
         args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
