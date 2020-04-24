@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import logging
 import argparse
+import mimetypes
 import urllib.parse
 import urllib.request
 
@@ -56,13 +57,16 @@ async def read_http(reader):
     return urllib.parse.unquote(first.decode()), headers
 
 
-def write_http(writer, status, obj=b''):
+def write_http(writer, status, obj=b'', mimetype=None):
     content = obj
+    mimetype = mimetype if mimetype else 'application/octet-stream'
+
     if type(obj) is not bytes:
         content = json.dumps(obj, indent=4, sort_keys=True).encode()
+        mimetype = 'application/json'
 
-    writer.write('HTTP/1.0 {}\nContent-Length: {}\n\n'.format(
-        status, len(content)).encode())
+    writer.write('HTTP/1.0 {}\nContent-Length:{}\nContent-Type:{}\n\n'.format(
+        status, len(content), mimetype).encode())
 
     writer.write(content)
 
@@ -232,13 +236,12 @@ async def handler(reader, writer):
 
     # READ
     if 'get' == method.lower():
-        cmd = url[1]
+        if url[1] not in ('json', 'blob', 'static'):
+            return writer.close()
 
-        if 'keys' == cmd:
+        keys = [url[2].strip()]
+        if 'json' == url[1]:
             keys = [k.strip() for k in url[2].split(',')]
-
-        if cmd in ('key', 'static'):
-            keys = [url[2].strip()]
 
         # Must not return data that is not replicated by a quorum
         commit_seq = committed_seq(state)
@@ -250,15 +253,20 @@ async def handler(reader, writer):
                          order by seq desc limit 1
                       ''', key.encode(), commit_seq).fetchone()
             if row:
-                result.append((key, row[0], json.loads(row[1].decode())))
+                if 'json' == url[1]:
+                    result.append((key, row[0], json.loads(row[1].decode())))
+                else:
+                    result.append((key, row[0], row[1],
+                                   mimetypes.guess_type(key)[0]))
 
         sql.rollback()
 
-        if 'keys' == cmd:
+        if 'json' == url[1]:
             write_http(writer, '200 OK', result)
-
-        if cmd in ('key', 'static'):
-            write_http(writer, '200 OK', result[0][2] if result else b'')
+        else:
+            write_http(writer, '200 OK',
+                       result[0][2] if result else b'',
+                       result[0][3] if result else None)
 
         log('get(%s) keys(%d) commit_seq(%d)', url[0], len(result), commit_seq)
         return writer.close()
@@ -266,7 +274,7 @@ async def handler(reader, writer):
     assert(method.lower() in ('sync'))
 
     def log_prefix():
-        i = 1 if sockname[0] in ('127.0.0.1', '::1') else 0
+        i = 1 if sockname[0] == peername[0] else 0
         return 'master({}) slave({}) role({}) db({})'.format(
             sockname[i], peername[i], state['role'], url[0])
 
@@ -451,10 +459,9 @@ async def sync(db):
                 reader = None
                 continue
 
+            i = 1 if sockname[0] == peername[0] else 0
             log_prefix = 'slave({}) master({}) db({})'.format(
-                sockname[1 if sockname[0] in ('127.0.0.1', '::1') else 0],
-                peername[1 if peername[0] in ('127.0.0.1', '::1') else 0],
-                db)
+                sockname[i], peername[i], db)
 
             try:
                 writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
@@ -527,12 +534,7 @@ async def sync(db):
 
 
 async def timekeeper():
-    start = time.time()
-    timeout = time.time()*10**9 % 10
-
-    while time.time() < start + timeout:
-        await asyncio.sleep(1)
-
+    await asyncio.sleep(time.time()*10**9 % 30)
     os._exit(1)
 
 
@@ -636,27 +638,28 @@ class Client():
                 self.leaders = None
                 time.sleep(2)
 
-    def key(self, db, key):
-        for i in range(10):
+    def blob(self, db, key):
+        for i in range(30):
             try:
-                url = '{}/key/{}'.format(self.leader(db)['url'], key)
+                url = '{}/blob/{}'.format(self.leader(db)['url'], key)
 
                 with urllib.request.urlopen(url) as r:
                     return r.read()
             except Exception:
                 self.leaders = None
-                time.sleep(2)
+                time.sleep(1)
 
-    def keys(self, db, keys):
-        for i in range(10):
+    def json(self, db, keys):
+        for i in range(30):
             try:
-                url = '{}/keys/{}'.format(self.leader(db)['url'],
-                                          ','.join(keys))
+                url = self.leader(db)['url']
+                url = '{}/json/{}'.format(url, ','.join(keys))
+
                 with urllib.request.urlopen(url) as r:
                     return json.loads(r.read())
             except Exception:
                 self.leaders = None
-                time.sleep(2)
+                time.sleep(1)
 
 
 if __name__ == '__main__':
@@ -671,8 +674,8 @@ if __name__ == '__main__':
     args.add_argument('--init', dest='db')
     args.add_argument('--password', dest='password')
 
-    args.add_argument('--key', dest='key')
-    args.add_argument('--keys', dest='keys')
+    args.add_argument('--blob', dest='blob')
+    args.add_argument('--json', dest='json')
     args.add_argument('--put', dest='put')
     args = args.parse_args()
 
@@ -689,16 +692,16 @@ if __name__ == '__main__':
         server()
     elif args.db:
         init()
-    elif args.key:
-        db, key = args.key.split('/')
+    elif args.blob:
+        db, key = args.blob.split('/')
         log('Fetching : {}'.format(client.leader(db)))
 
-        print(client.key(db, key))
-    elif args.keys:
-        db, keys = args.keys.split('/')
+        print(client.blob(db, key))
+    elif args.json:
+        db, keys = args.json.split('/')
         log('Fetching : {}'.format(client.leader(db)))
 
-        for key, version, value in client.keys(db, keys.split(',')):
+        for key, version, value in client.json(db, keys.split(',')):
             print('{} {} {}'.format(key, version, value))
     elif args.put:
         db, filename = args.put.split('/')
