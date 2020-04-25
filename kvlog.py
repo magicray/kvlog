@@ -149,8 +149,11 @@ async def handler(reader, writer):
         is_a_follower = 'following' in state
 
         if not_a_leader or is_a_follower or no_quorum:
-            write_http(writer, '503 Service Unavailable', state)
+            write_http(writer, '503 Service Unavailable')
             return writer.close()
+
+    log_prefix = 'client({}:{}) db({})'.format(
+        peername[0], peername[1], url[0])
 
     # APPEND
     if method.lower() in ('put', 'post'):
@@ -224,13 +227,15 @@ async def handler(reader, writer):
         # Great - our request was not rejected due to a conflict.
         # Let's wait till a quorum replicates the data in their logs
         if 'ok' == result['status']:
-            while result['txn_seq'] < committed_seq(state):
+            while result['txn_seq'] > committed_seq(state):
                 await asyncio.sleep(0.1)
 
-        result['committed_seq'] = committed_seq(state)
+        result.update(dict(
+            committed_seq=committed_seq(state),
+            server='{}:{}'.format(sockname[0], sockname[1])))
 
         write_http(writer, '200 OK', result)
-        log('put(%s) content(%s)', url[0], str(result))
+        log('%s put(%s)', log_prefix, str(result))
 
         return writer.close()
 
@@ -268,7 +273,7 @@ async def handler(reader, writer):
                        result[0][2] if result else b'',
                        result[0][3] if result else None)
 
-        log('get(%s) keys(%d) commit_seq(%d)', url[0], len(result), commit_seq)
+        log('%s get(%d) commit_seq(%d)', log_prefix, len(result), commit_seq)
         return writer.close()
 
     assert(method.lower() in ('sync'))
@@ -294,29 +299,22 @@ async def handler(reader, writer):
         my_term, my_seq = term_and_seq(sql)
         sql.rollback()
 
-        # If quorum already reached, accept more followers, after sanity check
-        if has_quorum(state):
-            if (my_term, my_seq) < (peer_term, peer_seq):
-                log('%s rejected as (%d %d) < (%d %d)', log_prefix(),
-                    my_term, my_seq, peer_term, peer_seq)
-                return writer.close()
+        # Reject a follower if my state is worse than peer's state
+        # These two can never be equal due to unique checksum
+        mystate = (my_term, my_seq, state['chksum'])
+        peerstate = (peer_term, peer_seq, peer_chksum)
 
-        # else accept only if my (term, seq, uniq_id) is bigger than peer
-        else:
-            mystate = (my_term, my_seq, state['chksum'])
-            peerstate = (peer_term, peer_seq, peer_chksum)
-
-            # These two can never be equal due to unique checksum
-            if mystate < peerstate:
-                log('%s rejected as (%d %d id) < (%d %d id)', log_prefix(),
-                    my_term, my_seq, peer_term, peer_seq)
-                return writer.close()
+        if mystate < peerstate:
+            log('%s rejected as (%d %d) < (%d %d)', log_prefix(),
+                my_term, my_seq, peer_term, peer_seq)
+            return writer.close()
 
         # Decided to accept this follower, lets calculate common max seq
         # This is always correct. Even though inefficient.
         # When a peer is a couple of terms behind, its ok if it gets a little
         # redundant data, as it is not a common case.
-        next_seq = peer_term
+        if my_term > peer_term:
+            next_seq = peer_term
 
         # But every time, a quorum would have same last term, after the current
         # leader crashes or exits. Let's try to optimize this frequent case
@@ -367,8 +365,8 @@ async def handler(reader, writer):
                 writer.write(struct.pack('!Q', len(value)))
                 writer.write(value)
 
-                log('%s seq(%d) key(%d) value(%d)',
-                    log_prefix(), seq, len(key), len(value))
+                # log('%s seq(%d) key(%d) value(%d)',
+                #     log_prefix(), seq, len(key), len(value))
 
                 rows_sent += 1
 
@@ -393,11 +391,12 @@ async def handler(reader, writer):
 
                 # Quorum is in sync with its logs
                 if max_seq == committed_seq(state):
-                    sql('insert into kv values(null, null, ?)', '{}:{}'.format(
-                        sockname, int(time.time()*10**9)).encode())
+                    sql('insert into kv values(null, null, ?)',
+                        '{}:{}:{}'.format(sockname[0], sockname[1],
+                                          int(time.time()*10**9)).encode())
 
-                    state['role'] = 'candidate'
                     sql.commit()
+                    state['role'] = 'candidate'
                     continue
 
                 sql.rollback()
@@ -469,6 +468,7 @@ async def sync(db):
                 # Tell the leader our current state.
                 # Leader would decide the starting point of replication for us.
                 term, seq = term_and_seq(sql)
+                sql.rollback()
 
                 writer.write(args.token)
                 writer.write(struct.pack('!QQ', term, seq))
@@ -516,8 +516,8 @@ async def sync(db):
             sql('insert into kv values(?,?,?)', seq,
                 key if key else None, value if value else None)
 
-            log('%s seq(%d) key(%d) value(%d)',
-                log_prefix, seq, len(key), len(value))
+            # log('%s seq(%d) key(%d) value(%d)',
+            #     log_prefix, seq, len(key), len(value))
 
             rows_received += 1
 
@@ -534,7 +534,7 @@ async def sync(db):
 
 
 async def timekeeper():
-    await asyncio.sleep(time.time()*10**9 % 30)
+    await asyncio.sleep(time.time()*10**9 % 10)
     os._exit(1)
 
 
@@ -605,61 +605,60 @@ class Client():
         self.servers = servers
         self.leaders = dict()
 
+    def server_list(self, db):
+        servers = [self.leaders[db]] if db in self.leaders else []
+        servers.extend(self.servers)
+
+        return servers
+
     def leader(self, db=None):
-        if db not in self.leaders:
-            result = dict()
+        result = dict()
 
-            for ip, port in self.servers:
-                url = 'http://{}:{}'.format(ip, port)
-
-                try:
-                    with urllib.request.urlopen(url) as r:
-                        for k, v in json.loads(r.read()).items():
-                            result[k] = dict(seq=v, url=url + '/{}'.format(k))
-                except Exception:
-                    pass
-
-            self.leaders = result
-
-        return self.leaders.get(db, None)
-
-    def put(self, db, filename):
-        with open(filename, 'rb') as f:
-            data = f.read()
-
-        for i in range(10):
+        for ip, port in self.servers:
             try:
-                req = urllib.request.Request(
-                    self.leader(db)['url'], data=data, method='PUT')
+                server = '{}:{}'.format(ip, port)
+                with urllib.request.urlopen('http://' + server) as r:
+                    for k, v in json.loads(r.read()).items():
+                        result[k] = dict(seq=v, server=server)
+            except Exception:
+                pass
+
+        return result
+
+    def put(self, db, data):
+        for ip, port in self.server_list(db):
+            try:
+                url = 'http://{}:{}/{}'.format(ip, port, db)
+                req = urllib.request.Request(url, data=data, method='PUT')
 
                 with urllib.request.urlopen(req) as r:
+                    self.leaders[db] = (ip, port)
                     return json.loads(r.read())
             except Exception:
-                self.leaders = None
-                time.sleep(2)
+                continue
 
     def blob(self, db, key):
-        for i in range(30):
+        for ip, port in self.server_list(db):
             try:
-                url = '{}/blob/{}'.format(self.leader(db)['url'], key)
+                url = 'http://{}:{}/{}/blob/{}'.format(ip, port, db, key)
 
                 with urllib.request.urlopen(url) as r:
+                    self.leaders[db] = (ip, port)
                     return r.read()
             except Exception:
-                self.leaders = None
-                time.sleep(1)
+                continue
 
     def json(self, db, keys):
-        for i in range(30):
+        for ip, port in self.server_list(db):
             try:
-                url = self.leader(db)['url']
-                url = '{}/json/{}'.format(url, ','.join(keys))
+                url = 'http://{}:{}/{}/json/{}'.format(ip, port, db,
+                                                       ','.join(keys))
 
                 with urllib.request.urlopen(url) as r:
+                    self.leaders[db] = (ip, port)
                     return json.loads(r.read())
             except Exception:
-                self.leaders = None
-                time.sleep(1)
+                continue
 
 
 if __name__ == '__main__':
@@ -694,20 +693,17 @@ if __name__ == '__main__':
         init()
     elif args.blob:
         db, key = args.blob.split('/')
-        log('Fetching : {}'.format(client.leader(db)))
 
         print(client.blob(db, key))
     elif args.json:
         db, keys = args.json.split('/')
-        log('Fetching : {}'.format(client.leader(db)))
 
         for key, version, value in client.json(db, keys.split(',')):
             print('{} {} {}'.format(key, version, value))
     elif args.put:
         db, filename = args.put.split('/')
-        log('Updating : {}'.format(client.leader(db)))
 
-        pprint.pprint(client.put(db, filename))
+        with open(filename, 'rb') as f:
+            pprint.pprint(client.put(db, f.read()))
     else:
-        client.leader()
-        pprint.pprint(client.leaders)
+        pprint.pprint(client.leader())
