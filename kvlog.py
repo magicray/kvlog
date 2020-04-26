@@ -391,7 +391,7 @@ async def handler(reader, writer):
 
                 # Quorum is in sync with its logs
                 if max_seq == committed_seq(state):
-                    sql('insert into kv values(null, null, ?)',
+                    sql('insert into kv values(?, null, ?)', max_seq + 1,
                         '{}:{}:{}'.format(sockname[0], sockname[1],
                                           int(time.time()*10**9)).encode())
 
@@ -524,6 +524,7 @@ async def sync(db):
         sql.commit()
 
         term, seq = term_and_seq(sql)
+        sql.rollback()
 
         if rows_received:
             log('%s term(%d) seq(%d) received(%d)',
@@ -588,9 +589,9 @@ def init():
     #
     # Committed sequence number is the max seq reported by a quorum.
     sql('''create table if not exists kv(
-        seq   integer primary key autoincrement,
-        key   blob,
-        value blob)''')
+           seq   integer primary key autoincrement,
+           key   blob,
+           value blob)''')
     sql('create index if not exists key on kv(key)')
 
     # seq = 1, must always be present for initial election to start
