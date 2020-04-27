@@ -674,7 +674,7 @@ if __name__ == '__main__':
     args.add_argument('--port', dest='port', type=int)
     args.add_argument('--peers', dest='peers')
     args.add_argument('--token', dest='token',
-                      default=os.getenv('KEYVALUESTORE', 'keyvaluestore'))
+                      default=os.getenv('KVLOG_TOKEN', 'kvlog'))
 
     args.add_argument('--init', dest='db')
     args.add_argument('--password', dest='password')
