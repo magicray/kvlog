@@ -428,7 +428,7 @@ async def handler(reader, writer):
                     count, key_len, value_len)
 
             # Avoid a busy loop
-            await asyncio.sleep(1.0/50)
+            await asyncio.sleep(1.0/50 if count > 0 else 1)
     except Exception:
         sql.rollback()
         state['followers'].pop(peername, None)
@@ -539,7 +539,7 @@ async def sync(db):
 
 
 async def timekeeper():
-    await asyncio.sleep(time.time()*10**9 % 10)
+    await asyncio.sleep(time.time()*10**9 % 600)
     os._exit(1)
 
 
