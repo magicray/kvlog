@@ -160,8 +160,8 @@ async def handler(reader, writer):
         content = await reader.read(int(headers['content-length']))
         state['txns'][sockname] = json.loads(content.decode())
 
-        # Lets wait for enough requests so that we can commit a batch
-        await asyncio.sleep(0.1)
+        # Let's batch requests as SQLite can do only 50 txns per second.
+        await asyncio.sleep(1.0/50)
 
         # No one else has processed this batch in last one second
         if type(state['txns'][sockname]) is list:
@@ -200,18 +200,22 @@ async def handler(reader, writer):
                     if key:
                         keyset.add(key)
 
+            term, seq = term_and_seq(sql)
+
             # Only non conflicting keys remaining. Let's append them to log
             for sock in state['txns']:
                 if type(state['txns'][sock]) is not list:
                     continue
 
+                keys = dict()
                 for key, version, value in state['txns'][sock]:
-                    sql('insert into kv values(null,?,?)',
+                    seq += 1
+                    sql('insert into kv values(?,?,?)', seq,
                         key.encode(),
                         json.dumps(value).encode())
+                    keys[key] = seq
 
-                state['txns'][sock] = dict(status='ok',
-                                           keys=len(state['txns'][sock]))
+                state['txns'][sock] = dict(status='ok', keys=keys)
 
             sql.commit()
 
@@ -276,14 +280,15 @@ async def handler(reader, writer):
         log('%s get(%d) commit_seq(%d)', log_prefix, len(result), commit_seq)
         return writer.close()
 
-    assert(method.lower() in ('sync'))
+    # SYNC - That's why this project exists
+    if 'sync' != method.lower():
+        return writer.close()
 
     def log_prefix():
         i = 1 if sockname[0] == peername[0] else 0
         return 'master({}) slave({}) role({}) db({})'.format(
             sockname[i], peername[i], state['role'], url[0])
 
-    # SYNC - That's why this project exists
     try:
         # Reject any stray peer
         if args.token != await reader.readexactly(16):
@@ -353,7 +358,7 @@ async def handler(reader, writer):
                          where seq >= ? order by seq
                       ''', next_seq)
 
-            rows_sent = 0
+            count = key_len = value_len = 0
             for seq, key, value in cur:
                 writer.write(struct.pack('!Q', seq))
 
@@ -365,10 +370,9 @@ async def handler(reader, writer):
                 writer.write(struct.pack('!Q', len(value)))
                 writer.write(value)
 
-                # log('%s seq(%d) key(%d) value(%d)',
-                #     log_prefix(), seq, len(key), len(value))
-
-                rows_sent += 1
+                count += 1
+                key_len += len(key)
+                value_len += len(value)
 
             sql.rollback()
 
@@ -418,12 +422,13 @@ async def handler(reader, writer):
 
                 sql.rollback()
 
-            if rows_sent > 0:
-                log('%s term(%d) seq(%d) sent(%d)',
-                    log_prefix(), peer_term, peer_seq, rows_sent)
+            if count > 0:
+                log('%s term(%d) seq(%d) count(%d) key_len(%d) value_len(%d)',
+                    log_prefix(), peer_term, peer_seq,
+                    count, key_len, value_len)
 
             # Avoid a busy loop
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0/50)
     except Exception:
         sql.rollback()
         state['followers'].pop(peername, None)
@@ -496,7 +501,7 @@ async def sync(db):
     state['following'] = (ip, port)
 
     while True:
-        rows_received = 0
+        count = key_len = value_len = 0
         while True:
             seq = struct.unpack('!Q', await reader.readexactly(8))[0]
 
@@ -516,19 +521,18 @@ async def sync(db):
             sql('insert into kv values(?,?,?)', seq,
                 key if key else None, value if value else None)
 
-            # log('%s seq(%d) key(%d) value(%d)',
-            #     log_prefix, seq, len(key), len(value))
-
-            rows_received += 1
+            count += 1
+            key_len += len(key)
+            value_len += len(value)
 
         sql.commit()
 
         term, seq = term_and_seq(sql)
         sql.rollback()
 
-        if rows_received:
-            log('%s term(%d) seq(%d) received(%d)',
-                log_prefix, term, seq, rows_received)
+        if count:
+            log('%s term(%d) seq(%d) count(%d) key_len(%d) value_len(%d)',
+                log_prefix, term, seq, count, key_len, value_len)
 
         # Inform the leader that we committed till seq and ask for more
         writer.write(struct.pack('!QQ', term, seq))
@@ -596,8 +600,9 @@ def init():
 
     # seq = 1, must always be present for initial election to start
     # It is utilized for storing configuration data for this db
-    sql('delete from kv where seq=1')
-    sql('insert into kv values(1, null, ?)', args.password)
+    sql('delete from kv where seq < 2')
+    sql('insert into kv values(0, null, ?)', args.password)
+    sql('insert into kv values(1, null, null)')
     sql.commit()
 
 
