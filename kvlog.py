@@ -160,8 +160,8 @@ async def handler(reader, writer):
         content = await reader.read(int(headers['content-length']))
         state['txns'][sockname] = json.loads(content.decode())
 
-        # Let's batch requests as SQLite can do only 50 txns per second.
-        await asyncio.sleep(1.0/50)
+        # Let's batch requests to limit the number of transactions
+        await asyncio.sleep(0.1)
 
         # No one else has processed this batch in last one second
         if type(state['txns'][sockname]) is list:
@@ -235,8 +235,9 @@ async def handler(reader, writer):
                 await asyncio.sleep(0.1)
 
         result.update(dict(
+            db=url[0],
             committed_seq=committed_seq(state),
-            server='{}:{}'.format(sockname[0], sockname[1])))
+            server=(sockname[0], sockname[1])))
 
         write_http(writer, '200 OK', result)
         log('%s put(%s)', log_prefix, str(result))
@@ -428,7 +429,7 @@ async def handler(reader, writer):
                     count, key_len, value_len)
 
             # Avoid a busy loop
-            await asyncio.sleep(1.0/50 if count > 0 else 1)
+            await asyncio.sleep(0.1)
     except Exception:
         sql.rollback()
         state['followers'].pop(peername, None)
@@ -545,7 +546,6 @@ async def timekeeper():
 
 def server():
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.start_server(handler, '', args.port))
 
@@ -553,11 +553,19 @@ def server():
 
     for db in sorted(glob.glob('db/*.sqlite3')):
         db = '.'.join(os.path.basename(db).split('.')[:-1])
-        # sql = SQLite(os.path.join('db', db))
+        sql = SQLite(os.path.join('db', db))
         state = args.state.setdefault(db, dict())
 
-        # cluster = sql('select value from kv where seq=0').fetchone()[0]
-        # sql.rollback()
+        rows = sql('''select seq from kv where key is null
+                      order by seq desc limit 2''').fetchall()
+
+        rows = sql('select key, seq from kv where ? < seq < ?',
+                   rows[1][0], rows[0][0])
+
+        for key, seq in rows:
+            sql('delete from kv where key = ? and seq < ?', key, seq)
+
+        sql.commit()
 
         state['txns'] = dict()
         state['role'] = 'voter'
