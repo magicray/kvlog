@@ -138,17 +138,14 @@ async def handler(reader, writer):
 
     sql = SQLite(os.path.join('db', url[0]))
     state = args.state[url[0]]
+    instance_id = state['instance_id']
 
     peername = writer.get_extra_info('peername')
     sockname = writer.get_extra_info('sockname')
 
     # Don't read/write until elected leader or lost quorum
     if method.lower() in ('get', 'put', 'post'):
-        no_quorum = not has_quorum(state)
-        not_a_leader = 'leader' != state['role']
-        is_a_follower = 'following' in state
-
-        if not_a_leader or is_a_follower or no_quorum:
+        if 'leader' != state['role'] or has_quorum(state) is False:
             write_http(writer, '503 Service Unavailable')
             return writer.close()
 
@@ -161,7 +158,7 @@ async def handler(reader, writer):
         state['txns'][sockname] = json.loads(content.decode())
 
         # Let's batch requests to limit the number of transactions
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.250)
 
         # No one else has processed this batch in last one second
         if type(state['txns'][sockname]) is list:
@@ -217,10 +214,8 @@ async def handler(reader, writer):
 
                 state['txns'][sock] = dict(status='ok', keys=keys)
 
-            sql.commit()
-
             term, seq = term_and_seq(sql)
-            sql.rollback()
+            sql.commit()
 
             for sock in state['txns']:
                 state['txns'][sock]['txn_seq'] = seq
@@ -232,7 +227,7 @@ async def handler(reader, writer):
         # Let's wait till a quorum replicates the data in their logs
         if 'ok' == result['status']:
             while result['txn_seq'] > committed_seq(state):
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.250)
 
         result.update(dict(
             db=url[0],
@@ -336,19 +331,21 @@ async def handler(reader, writer):
         # But wait till we have a quorum of followers, or
         # sync() starts following someone better than us
         state['followers'][peername] = 0
-        while has_quorum(state) is False and 'following' not in state:
-            await asyncio.sleep(0.1)
+        while has_quorum(state) is False and 'voter' == state['role']:
+            await asyncio.sleep(0.250)
 
         # Reject this follower if we started following someone else
-        if 'following' in state:
-            log('%s rejected following(%s)', log_prefix(), state['following'])
+        if 'follower' == state['role']:
+            state['followers'].pop(peername)
+            log('%s rejected%s', log_prefix(), peername)
             return writer.close()
 
         # Great. Have a quorum and not following anyone else
         # Set the flag so that sync() exits
         #
         # Leader election - step 1 of 3
-        state['role'] = 'quorum'
+        if 'voter' == state['role']:
+            state['role'] = 'quorum'
 
         # Signal to the peer that it has been accepted as a follower
         writer.write(struct.pack('!Q', 0))
@@ -359,7 +356,7 @@ async def handler(reader, writer):
                          where seq >= ? order by seq
                       ''', next_seq)
 
-            count = key_len = value_len = 0
+            count = key_bytes = value_bytes = 0
             for seq, key, value in cur:
                 writer.write(struct.pack('!Q', seq))
 
@@ -372,10 +369,19 @@ async def handler(reader, writer):
                 writer.write(value)
 
                 count += 1
-                key_len += len(key)
-                value_len += len(value)
+                key_bytes += len(key)
+                value_bytes += len(value)
 
             sql.rollback()
+
+            # Avoid a busy loop
+            if 0 == count:
+                await asyncio.sleep(0.250)
+                continue
+
+            if instance_id != state['instance_id']:
+                state['followers'].pop(peername)
+                return writer.close()
 
             writer.write(struct.pack('!Q', 0))
 
@@ -423,37 +429,30 @@ async def handler(reader, writer):
 
                 sql.rollback()
 
-            if count > 0:
-                log('%s term(%d) seq(%d) count(%d) key_len(%d) value_len(%d)',
-                    log_prefix(), peer_term, peer_seq,
-                    count, key_len, value_len)
-
-            # Avoid a busy loop
-            await asyncio.sleep(0.1)
+            log('%s term(%d) seq(%d) count(%d) key_bytes(%d) value_bytes(%d)',
+                log_prefix(), peer_term, peer_seq,
+                count, key_bytes, value_bytes)
     except Exception:
         sql.rollback()
-        state['followers'].pop(peername, None)
+        state['followers'].pop(peername)
         log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(state),
             len(state['followers']))
 
         # Had a quorum once but not anymore. Too many complex cases to handle.
-        # Its safer to exit and start from a clean slate.
-        if 'voter' != state['role'] and has_quorum(state) is False:
-            os._exit(1)
+        # Its safer to start from a clean slate.
+        if state['role'] in ('quorum', 'candidate', 'leader'):
+            if has_quorum(state) is False:
+                reset(url[0])
 
     sql.rollback()
     writer.close()
 
 
-async def sync(db):
+async def sync(db, instance_id):
     sql = SQLite(os.path.join('db', db))
     state = args.state[db]
 
     while True:
-        # Got a quorum of followers, no need to follow anyone else
-        if 'voter' != state['role']:
-            return
-
         for ip, port in args.peers:
             try:
                 reader, writer = await asyncio.open_connection(ip, port)
@@ -491,57 +490,85 @@ async def sync(db):
         if reader:
             break
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.250)
 
-    # Got a quorum to lead before our search for leader was successful
+    # Already a candidate/leader/follower
     if 'voter' != state['role']:
         return writer.close()
 
-    # Ensure that we do not try to become a leader anymore
-    # as we have found a better leader
-    state['following'] = (ip, port)
+    # Any old sync() task must exit
+    if instance_id != state['instance_id']:
+        return writer.close()
 
-    while True:
-        count = key_len = value_len = 0
+    # Ensure that we do not try to become a leader now
+    state['role'] = 'follower'
+
+    try:
         while True:
-            seq = struct.unpack('!Q', await reader.readexactly(8))[0]
+            count = key_bytes = value_bytes = 0
+            while True:
+                seq = struct.unpack('!Q', await reader.readexactly(8))[0]
 
-            if 0 == seq:
-                break
+                if 0 == seq:
+                    break
 
-            key = await reader.readexactly(
-                struct.unpack('!Q', await reader.readexactly(8))[0])
-            value = await reader.readexactly(
-                struct.unpack('!Q', await reader.readexactly(8))[0])
+                key = await reader.readexactly(
+                    struct.unpack('!Q', await reader.readexactly(8))[0])
+                value = await reader.readexactly(
+                    struct.unpack('!Q', await reader.readexactly(8))[0])
 
-            # Delete any redundant entries earlier leader might have.
-            # This should be done only once - optimization - some day.
-            sql('delete from kv where seq >= ?', seq)
+                # Delete any redundant entries earlier leader might have.
+                # This should be done only once - optimization - some day.
+                sql('delete from kv where seq >= ?', seq)
 
-            # Replicate the entry we got from the leader
-            sql('insert into kv values(?,?,?)', seq,
-                key if key else None, value if value else None)
+                # Replicate the entry we got from the leader
+                sql('insert into kv values(?,?,?)', seq,
+                    key if key else None, value if value else None)
 
-            count += 1
-            key_len += len(key)
-            value_len += len(value)
+                count += 1
+                key_bytes += len(key)
+                value_bytes += len(value)
 
-        sql.commit()
+            term, seq = term_and_seq(sql)
+            sql.commit()
 
-        term, seq = term_and_seq(sql)
-        sql.rollback()
+            log('%s term(%d) seq(%d) count(%d) key_bytes(%d) value_bytes(%d)',
+                log_prefix, term, seq, count, key_bytes, value_bytes)
 
-        if count:
-            log('%s term(%d) seq(%d) count(%d) key_len(%d) value_len(%d)',
-                log_prefix, term, seq, count, key_len, value_len)
-
-        # Inform the leader that we committed till seq and ask for more
-        writer.write(struct.pack('!QQ', term, seq))
+            # Inform the leader that we committed till seq and ask for more
+            writer.write(struct.pack('!QQ', term, seq))
+    except Exception:
+        reset(db)
 
 
 async def timekeeper():
-    await asyncio.sleep(time.time()*10**9 % 600)
+    await asyncio.sleep(time.time()*10**9 % 60)
     os._exit(1)
+
+
+def reset(db):
+    sql = SQLite(os.path.join('db', db))
+    args.state[db] = dict()
+    state = args.state[db]
+
+    rows = sql('''select seq from kv where key is null
+                  order by seq desc limit 2''').fetchall()
+
+    rows = sql('select key, seq from kv where ? < seq < ?',
+               rows[1][0], rows[0][0])
+
+    for key, seq in rows:
+        sql('delete from kv where key = ? and seq < ?', key, seq)
+
+    sql.commit()
+
+    state['txns'] = dict()
+    state['role'] = 'voter'
+    state['followers'] = dict()
+    state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
+    state['instance_id'] = int(time.time()*10**9)
+
+    asyncio.ensure_future(sync(db, state['instance_id']))
 
 
 def server():
@@ -552,27 +579,7 @@ def server():
     asyncio.ensure_future(timekeeper())
 
     for db in sorted(glob.glob('db/*.sqlite3')):
-        db = '.'.join(os.path.basename(db).split('.')[:-1])
-        sql = SQLite(os.path.join('db', db))
-        state = args.state.setdefault(db, dict())
-
-        rows = sql('''select seq from kv where key is null
-                      order by seq desc limit 2''').fetchall()
-
-        rows = sql('select key, seq from kv where ? < seq < ?',
-                   rows[1][0], rows[0][0])
-
-        for key, seq in rows:
-            sql('delete from kv where key = ? and seq < ?', key, seq)
-
-        sql.commit()
-
-        state['txns'] = dict()
-        state['role'] = 'voter'
-        state['followers'] = dict()
-        state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
-
-        asyncio.ensure_future(sync(db))
+        reset('.'.join(os.path.basename(db).split('.')[:-1]))
 
     def exception_handler(loop, context):
         log(context['future'])
