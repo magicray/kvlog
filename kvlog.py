@@ -285,6 +285,9 @@ async def handler(reader, writer):
         return 'master({}) slave({}) role({}) db({})'.format(
             sockname[i], peername[i], state['role'], url[0])
 
+    def cur_instance_id():
+        return args.state[url[0]]['instance_id']
+
     try:
         # Reject any stray peer
         if args.token != await reader.readexactly(16):
@@ -311,38 +314,32 @@ async def handler(reader, writer):
             return writer.close()
 
         # Decided to accept this follower, lets calculate common max seq
-        # This is always correct. Even though inefficient.
-        # When a peer is a couple of terms behind, its ok if it gets a little
-        # redundant data, as it is not a common case.
-        if my_term > peer_term:
-            next_seq = peer_term
-
-        # But every time, a quorum would have same last term, after the current
-        # leader crashes or exits. Let's try to optimize this frequent case
-        # by not sending all the data from the last term again.
-        # We know that an entry can not be present in the log if the previous
-        # one was incorrect, lets just start from the last entry the peer has
-        # Only one redundant row in this case, but still avoids lots of complex
-        # case we need to consider otherwise.
-        if my_term == peer_term:
-            next_seq = peer_seq
+        # Following is always correct, though we are sending data that a
+        # follower might already have. But simple is better.
+        #
+        # Note that we always send at least one record, even if follower has
+        # exactly the same data as leader
+        #
+        # my_term is always >= peer_term, never <, as ensure by previous check
+        next_seq = peer_term if my_term > peer_term else peer_seq
 
         # Starting seq for replication is decided for this peer
         # But wait till we have a quorum of followers, or
         # sync() starts following someone better than us
         state['followers'][peername] = 0
-        while has_quorum(state) is False and 'voter' == state['role']:
-            await asyncio.sleep(0.250)
+        while 'voter' == state['role'] and has_quorum(state) is False:
+            if instance_id == cur_instance_id():
+                await asyncio.sleep(1)
+            else:
+                break
 
-        # Reject this follower if we started following someone else
-        if 'follower' == state['role']:
+        # Reject if request is old or we started following someone else
+        if 'follower' == state['role'] or instance_id != cur_instance_id():
             state['followers'].pop(peername)
             log('%s rejected%s', log_prefix(), peername)
             return writer.close()
 
         # Great. Have a quorum and not following anyone else
-        # Set the flag so that sync() exits
-        #
         # Leader election - step 1 of 3
         if 'voter' == state['role']:
             state['role'] = 'quorum'
@@ -352,11 +349,12 @@ async def handler(reader, writer):
 
         # And start sending the data
         while True:
+            count = key_bytes = value_bytes = 0
+
             cur = sql('''select seq, key, value from kv
                          where seq >= ? order by seq
                       ''', next_seq)
 
-            count = key_bytes = value_bytes = 0
             for seq, key, value in cur:
                 writer.write(struct.pack('!Q', seq))
 
@@ -374,13 +372,15 @@ async def handler(reader, writer):
 
             sql.rollback()
 
-            # Avoid a busy loop
             if 0 == count:
-                await asyncio.sleep(0.250)
+                # Avoid a busy loop
+                await asyncio.sleep(1)
                 continue
 
-            if instance_id != state['instance_id']:
-                state['followers'].pop(peername)
+            # Session has been reset while we were busy sending data
+            # Don't send the final message to ensure follower drops the
+            # entire data sent so far
+            if instance_id != cur_instance_id():
                 return writer.close()
 
             writer.write(struct.pack('!Q', 0))
@@ -471,7 +471,7 @@ async def sync(db, instance_id):
                 writer.write('SYNC /{} HTTP/1.1\n\n'.format(db).encode())
 
                 # Tell the leader our current state.
-                # Leader would decide the starting point of replication for us.
+                # Leader would decide the starting point of replication.
                 term, seq = term_and_seq(sql)
                 sql.rollback()
 
@@ -490,14 +490,11 @@ async def sync(db, instance_id):
         if reader:
             break
 
-        await asyncio.sleep(0.250)
+        await asyncio.sleep(1)
 
-    # Already a candidate/leader/follower
-    if 'voter' != state['role']:
-        return writer.close()
-
-    # Any old sync() task must exit
-    if instance_id != state['instance_id']:
+    state = args.state[db]
+    # Move to follower state only from voter state. Old instances not allowed.
+    if 'voter' != state['role'] or instance_id != state['instance_id']:
         return writer.close()
 
     # Ensure that we do not try to become a leader now
@@ -506,6 +503,7 @@ async def sync(db, instance_id):
     try:
         while True:
             count = key_bytes = value_bytes = 0
+
             while True:
                 seq = struct.unpack('!Q', await reader.readexactly(8))[0]
 
@@ -538,6 +536,7 @@ async def sync(db, instance_id):
             # Inform the leader that we committed till seq and ask for more
             writer.write(struct.pack('!QQ', term, seq))
     except Exception:
+        sql.rollback()
         reset(db)
 
 
