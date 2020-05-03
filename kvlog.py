@@ -547,8 +547,6 @@ async def timekeeper():
 
 def reset(db):
     sql = SQLite(os.path.join('db', db))
-    args.state[db] = dict()
-    state = args.state[db]
 
     rows = sql('''select seq from kv where key is null
                   order by seq desc limit 2''').fetchall()
@@ -561,13 +559,14 @@ def reset(db):
 
     sql.commit()
 
-    state['txns'] = dict()
-    state['role'] = 'voter'
-    state['followers'] = dict()
-    state['chksum'] = hashlib.md5((db + str(args.peers)).encode()).digest()
-    state['instance_id'] = int(time.time()*10**9)
+    args.state[db] = dict(
+        txns=dict(),
+        role='voter',
+        followers=dict(),
+        chksum=hashlib.md5((db + str(args.peers)).encode()).digest(),
+        instance_id=int(time.time()*10**9))
 
-    asyncio.ensure_future(sync(db, state['instance_id']))
+    asyncio.ensure_future(sync(db, args.state[db]['instance_id']))
 
 
 def server():
