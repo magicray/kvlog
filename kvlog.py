@@ -74,7 +74,7 @@ def write_http(writer, status, obj=b'', headers=dict()):
     writer.write(content)
 
 
-def quorum(state):
+def quorum():
     # Peers are the servers, other than this, in the cluster.
     # To be a leader, we want at least half of the peers to follow.
     # 1 peers -> 1 follower,  2 peers -> 1 follower
@@ -84,20 +84,20 @@ def quorum(state):
     return int((len(args.peers) + 1) / 2)
 
 
-def has_quorum(state):
+def has_quorum():
     # We are good to go if we already got sync requests from a quorum or more
-    return len(state['followers']) >= quorum(state)
+    return len(args.state['followers']) >= quorum()
 
 
-def committed_seq(state):
+def committed_seq():
     # It is pointless till we have a quorum
-    if not has_quorum(state):
+    if not has_quorum():
         return 0
 
     # If this node is a leader, it's max(seq) is guranteed to be biggest
-    commits = sorted(list(state['followers'].values()), reverse=True)
+    commits = sorted(list(args.state['followers'].values()), reverse=True)
 
-    return commits[quorum(state) - 1]
+    return commits[quorum() - 1]
 
 
 def term_and_seq(sql):
@@ -150,7 +150,7 @@ async def handler(reader, writer):
     if 'get' == method and req_key is None:
         write_http(writer, '200 OK', dict(
             role=state['role'], term=term, seq=seq,
-            committed=committed_seq(state)))
+            committed=committed_seq()))
         return writer.close()
 
     peername = writer.get_extra_info('peername')
@@ -158,7 +158,7 @@ async def handler(reader, writer):
 
     # Don't read/write until elected leader or lost quorum
     if method in ('get', 'put', 'post'):
-        if 'leader' != state['role'] or has_quorum(state) is False:
+        if 'leader' != state['role'] or has_quorum() is False:
             write_http(writer, '503 Service Unavailable')
             return writer.close()
 
@@ -212,12 +212,16 @@ async def handler(reader, writer):
         # Great - our request was not rejected due to a conflict.
         # Let's wait till a quorum replicates the data in their logs
         if 'ok' == result['status']:
-            while result['version'] > committed_seq(state):
+            while result['version'] > committed_seq():
                 await asyncio.sleep(0.05)
 
-        result['committed'] = committed_seq(state)
+        result['committed'] = committed_seq()
 
-        write_http(writer, '200 OK', result)
+        write_http(writer, '200 OK', value, {
+            'KVLOG_STATUS': result['status'],
+            'KVLOG_VERSION': result.get('existing_version', result['version']),
+            'KVLOG_COMMITTED': result['committed']})
+
         log('%s put(%s)', log_prefix, str(result))
 
         return writer.close()
@@ -225,7 +229,7 @@ async def handler(reader, writer):
     # READ
     if 'get' == method and type(req_key) is str:
         # Must not return data that is not replicated by a quorum
-        commit_seq = committed_seq(state)
+        commit_seq = committed_seq()
 
         row = sql('''select seq, lock, value from kv
                      where key=? and seq <= ?
@@ -251,7 +255,7 @@ async def handler(reader, writer):
 
     if 'get' == method and type(req_key) is int:
         # Must not return data that is not replicated by a quorum
-        commit_seq = committed_seq(state)
+        commit_seq = committed_seq()
 
         # key is actually a key
         if key == req_key:
@@ -329,7 +333,7 @@ async def handler(reader, writer):
         # But wait till we have a quorum of followers, or
         # sync() starts following someone better than us
         state['followers'][peername] = 0
-        while 'voter' == state['role'] and has_quorum(state) is False:
+        while 'voter' == state['role'] and has_quorum() is False:
             await asyncio.sleep(0.05)
 
         # Reject as we started following someone else
@@ -373,7 +377,7 @@ async def handler(reader, writer):
                 sql.rollback()
 
                 # Avoid a busy loop
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
             panic(state['role'] not in ('quorum', 'candidate', 'leader'),
@@ -396,7 +400,7 @@ async def handler(reader, writer):
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 # Quorum is in sync with its logs
-                if max_seq == committed_seq(state):
+                if max_seq == committed_seq():
                     sql('insert into kv values(?,null,null,null,?)', max_seq+1,
                         str((sockname, max_seq+1, int(time.time()*10**9),
                              os.getpid())))
@@ -419,7 +423,7 @@ async def handler(reader, writer):
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 # Quorum is in sync with its logs
-                if max_seq == committed_seq(state):
+                if max_seq == committed_seq():
                     state['role'] = 'leader'
                     log('%s term(%d)', log_prefix(), max_seq)
 
@@ -430,13 +434,13 @@ async def handler(reader, writer):
     except Exception:
         sql.rollback()
         state['followers'].pop(peername)
-        log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(state),
+        log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(),
             len(state['followers']))
 
         # Had a quorum once but not anymore. Too many complex cases to handle.
         # Its safer to start from a clean slate.
         if state['role'] in ('quorum', 'candidate', 'leader'):
-            panic(has_quorum(state) is False, 'quorum lost')
+            panic(has_quorum() is False, 'quorum lost')
 
     sql.rollback()
     writer.close()
@@ -527,7 +531,7 @@ async def sync():
         zz = sql('select uuid from kv where seq=?', s).fetchone()[0].encode()
 
         panic(zz != z, '{} != {}'.format(zz, z))
-        panic((xx, yy) > (x, y), '{} > {}'.format((xx, yy, zz), (x, y, z)))
+        panic((xx, yy) > (x, y), '{} > {}'.format((xx, yy), (x, y)))
 
         while True:
             seq = struct.unpack('!Q', await reader.readexactly(8))[0]
@@ -572,7 +576,7 @@ async def sync():
 
 async def timekeeper():
     t = time.time()
-    sec = int(time.time()*10**9 % 10)
+    sec = int(time.time()*10**9 % 600)
     await asyncio.sleep(sec)
     panic(True, 'timeout({}) elapsed({})'.format(sec, int(time.time()-t)))
 
@@ -666,7 +670,9 @@ class Client():
                 req = urllib.request.Request(url, data=value)
                 with urllib.request.urlopen(req) as r:
                     self.leader = (ip, port)
-                    return json.loads(r.read())
+                    return dict(status=r.headers['KVLOG_STATUS'],
+                                version=r.headers['KVLOG_VERSION'],
+                                committed=r.headers['KVLOG_COMMITTED'])
             except Exception:
                 pass
 
