@@ -119,11 +119,18 @@ def term_and_seq(sql):
     return term, seq
 
 
+def panic(cond, msg):
+    if cond:
+        log('panic(%s)', msg)
+        os._exit(1)
+
+
 async def handler(reader, writer):
     request, headers = await read_http(reader)
     method, url, _ = request.split()
 
     url = [u for u in url.split('/') if u]
+    method = method.lower()
 
     url.extend([None, None, None])
     req_key, req_version, req_lock = url[0:3]
@@ -140,7 +147,7 @@ async def handler(reader, writer):
     sql.rollback()
 
     # Current leader for each db managed by this cluster
-    if 'get' == method.lower() and req_key is None:
+    if 'get' == method and req_key is None:
         write_http(writer, '200 OK', dict(
             role=state['role'], term=term, seq=seq,
             committed=committed_seq(state)))
@@ -150,7 +157,7 @@ async def handler(reader, writer):
     sockname = writer.get_extra_info('sockname')
 
     # Don't read/write until elected leader or lost quorum
-    if method.lower() in ('get', 'put', 'post'):
+    if method in ('get', 'put', 'post'):
         if 'leader' != state['role'] or has_quorum(state) is False:
             write_http(writer, '503 Service Unavailable')
             return writer.close()
@@ -158,14 +165,14 @@ async def handler(reader, writer):
     log_prefix = 'client({}:{})'.format(peername[0], peername[1])
 
     # APPEND
-    if method.lower() in ('put', 'post') and type(req_key) is str:
-        state['txns'][sockname] = (req_key, req_version, req_content)
+    if method in ('put', 'post') and type(req_key) is str:
+        state['txns'][peername] = (req_key, req_version, req_content)
 
         # Let's batch requests to limit the number of transactions
         await asyncio.sleep(0.05)
 
         # No one else has processed this batch so far
-        if type(state['txns'][sockname]) is tuple:
+        if type(state['txns'][peername]) is tuple:
             term, seq = term_and_seq(sql)
 
             for sock in state['txns']:
@@ -187,22 +194,20 @@ async def handler(reader, writer):
                         continue
 
                 seq += 1
-                sql('insert into kv values(?, null, ?, ?, ?)',
-                    seq, key, value,
+                sql('insert into kv values(?, null, ?, ?, ?)', seq, key, value,
                     str((sockname, seq, int(time.time()*10**9), os.getpid())))
 
                 state['txns'][sock] = dict(status='ok', version=seq)
 
             term, seq = term_and_seq(sql)
 
-            if 'leader' != state['role']:
-                log('fatal(this should not happen)')
-                os._exit(1)
+            panic('leader' != state['role'],
+                  "{} can't commit".format(state['role']))
 
             sql.commit()
 
         # Someone has committed this batch by now. Lets examine the result.
-        result = state['txns'].pop(sockname)
+        result = state['txns'].pop(peername)
 
         # Great - our request was not rejected due to a conflict.
         # Let's wait till a quorum replicates the data in their logs
@@ -218,7 +223,7 @@ async def handler(reader, writer):
         return writer.close()
 
     # READ
-    if 'get' == method.lower() and type(req_key) is str:
+    if 'get' == method and type(req_key) is str:
         # Must not return data that is not replicated by a quorum
         commit_seq = committed_seq(state)
 
@@ -244,7 +249,7 @@ async def handler(reader, writer):
 
         return writer.close()
 
-    if 'get' == method.lower() and type(req_key) is int:
+    if 'get' == method and type(req_key) is int:
         # Must not return data that is not replicated by a quorum
         commit_seq = committed_seq(state)
 
@@ -282,7 +287,7 @@ async def handler(reader, writer):
         return writer.close()
 
     # SYNC - That's why this project exists
-    if 'sync' != method.lower():
+    if 'sync' != method:
         return writer.close()
 
     def log_prefix():
@@ -325,16 +330,16 @@ async def handler(reader, writer):
         # sync() starts following someone better than us
         state['followers'][peername] = 0
         while 'voter' == state['role'] and has_quorum(state) is False:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
 
-        # Reject if request is old or we started following someone else
+        # Reject as we started following someone else
         if 'follower' == state['role']:
             state['followers'].pop(peername)
             log('%s rejected%s', log_prefix(), peername)
             return writer.close()
 
-        # Great. Have a quorum and not following anyone else
         # Leader election - step 1 of 3
+        # Have a quorum and not following anyone else
         if 'voter' == state['role']:
             state['role'] = 'quorum'
             log('%s term(%d)', log_prefix(), my_seq+1)
@@ -351,12 +356,13 @@ async def handler(reader, writer):
             if rows:
                 # Send the current term/seq and uuid of the last row
                 x, y = term_and_seq(sql)
-                z = sql('select max(seq) from kv where seq<?', next_seq)
-                z = sql('select uuid from kv where seq=?', z.fetchone()[0])
-                z = z.fetchone()[0].encode()
+                s = sql('select max(seq) from kv where seq<?',
+                        next_seq).fetchone()[0]
+                z = sql('select uuid from kv where seq=?',
+                        s).fetchone()[0].encode()
                 sql.rollback()
 
-                writer.write(struct.pack('!QQQQ', next_seq, x, y, len(z)))
+                writer.write(struct.pack('!QQQQ', x, y, s, len(z)))
                 writer.write(z)
 
                 # Send the rows to be replicated
@@ -370,9 +376,8 @@ async def handler(reader, writer):
                 await asyncio.sleep(0.1)
                 continue
 
-            if state['role'] not in ('quorum', 'candidate', 'leader'):
-                log('fatal(this should not happen)')
-                os._exit(1)
+            panic(state['role'] not in ('quorum', 'candidate', 'leader'),
+                  '{} not quorum/candidate/leader'.format(state['role']))
 
             writer.write(struct.pack('!Q', 0))
 
@@ -383,20 +388,18 @@ async def handler(reader, writer):
 
             next_seq = peer_seq + 1
 
+            # Leader election - step 2 of 3
             # Wait for a quorum to fully replicate its log. Then insert a row
             # with null key to declare its candidature for leadership. The
             # seq for this row is the term number during new leaders reign.
-            #
-            # Leader election - step 2 of 3
             if 'quorum' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
                 # Quorum is in sync with its logs
                 if max_seq == committed_seq(state):
-                    sql('insert into kv values(?,null,null,null,?)',
-                        max_seq + 1, str((sockname, max_seq+1,
-                                          int(time.time()*10**9),
-                                          os.getpid())))
+                    sql('insert into kv values(?,null,null,null,?)', max_seq+1,
+                        str((sockname, max_seq+1, int(time.time()*10**9),
+                             os.getpid())))
 
                     sql.commit()
                     state['role'] = 'candidate'
@@ -405,14 +408,13 @@ async def handler(reader, writer):
 
                 sql.rollback()
 
+            # Leader election - step 3 of 3
             # Wait for a quorum to fully replicate its log, including the row
             # with null key, declaring the candidature of the new leader.
             # Since a quorum has accepted this new row and the logs are in sync
             # There is no backing off. Its safe to accept update requests.
             #
             # Leader is elected for the new term. WooHoo.
-            #
-            # Leader election - step 3 of 3
             if 'candidate' == state['role']:
                 max_seq = sql('select max(seq) from kv').fetchone()[0]
 
@@ -434,8 +436,7 @@ async def handler(reader, writer):
         # Had a quorum once but not anymore. Too many complex cases to handle.
         # Its safer to start from a clean slate.
         if state['role'] in ('quorum', 'candidate', 'leader'):
-            if has_quorum(state) is False:
-                os._exit(1)
+            panic(has_quorum(state) is False, 'quorum lost')
 
     sql.rollback()
     writer.close()
@@ -517,21 +518,16 @@ async def sync():
     while True:
         row_count = 0
 
-        seq, x, y, z = struct.unpack('!QQQQ', await reader.readexactly(32))
+        x, y, s, z = struct.unpack('!QQQQ', await reader.readexactly(32))
         z = await reader.readexactly(z)
 
         row_bytes = 32 + len(z)
 
         xx, yy = term_and_seq(sql)
-        zz = sql('select max(seq) from kv where seq < ?', seq)
-        zz = sql('select uuid from kv where seq=?', zz.fetchone()[0])
-        zz = zz.fetchone()[0].encode()
+        zz = sql('select uuid from kv where seq=?', s).fetchone()[0].encode()
 
-        """
-        if (xx, yy) > (x, y) or z != zz:
-            log('%s fatal(%s, %s)', log_prefix, (xx, yy, zz), (x, y, z))
-            os._exit(1)
-        """
+        panic(zz != z, '{} != {}'.format(zz, z))
+        panic((xx, yy) > (x, y), '{} > {}'.format((xx, yy, zz), (x, y, z)))
 
         while True:
             seq = struct.unpack('!Q', await reader.readexactly(8))[0]
@@ -541,29 +537,28 @@ async def sync():
 
             lock = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
-            lock = lock.decode() if lock else None
 
             key = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
-            key = key.decode() if key else None
 
             value = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
-            value = value if value else None
 
             uuid = await reader.readexactly(
                 struct.unpack('!Q', await reader.readexactly(8))[0])
-            uuid = uuid.decode() if uuid else None
 
             # Delete any redundant entries a crashed leader might have.
             sql('delete from kv where seq >= ?', seq)
 
             # Replicate the entry we got from the leader
-            sql('insert into kv values(?,?,?,?,?)',
-                seq, lock, key, value, uuid)
+            sql('insert into kv values(?,?,?,?,?)', seq,
+                lock.decode() if lock else None,
+                key.decode() if key else None,
+                value if value else None,
+                uuid.decode() if uuid else None)
 
             row_count += 1
-            row_bytes += 40
+            row_bytes += 40 + len(lock) + len(key) + len(value) + len(uuid)
 
         term, seq = term_and_seq(sql)
         sql.commit()
@@ -576,8 +571,10 @@ async def sync():
 
 
 async def timekeeper():
-    await asyncio.sleep(time.time()*10**9 % 10)
-    os._exit(1)
+    t = time.time()
+    sec = int(time.time()*10**9 % 10)
+    await asyncio.sleep(sec)
+    panic(True, 'timeout({}) elapsed({})'.format(sec, int(time.time()-t)))
 
 
 def server():
@@ -630,8 +627,7 @@ def server():
     asyncio.ensure_future(timekeeper())
 
     def exception_handler(loop, context):
-        log(context['future'])
-        os._exit(1)
+        panic(True, 'exception : {}'.format(context['future']))
 
     loop.set_exception_handler(exception_handler)
     loop.run_forever()
@@ -696,7 +692,7 @@ if __name__ == '__main__':
     args.add_argument('--token', dest='token',
                       default=os.getenv('KVLOG_TOKEN', 'kvlog'))
 
-    args.add_argument('--db', dest='db', default='kvlog.sqlite3')
+    args.add_argument('--db', dest='db', default='kvlog')
     args.add_argument('--password', dest='password')
 
     args.add_argument('--key', dest='key')
@@ -717,8 +713,7 @@ if __name__ == '__main__':
     elif args.value:
         pprint.pprint(client.put(args.key, args.value))
     elif args.file:
-        with open(args.file, 'rb') as fd:
-            pprint.pprint(client.put(args.key, fd.read()))
+        pprint.pprint(client.put(args.key, open(args.file, 'rb').read()))
     elif args.key:
         pprint.pprint(client.get(args.key))
     else:
