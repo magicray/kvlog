@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import pprint
 import struct
 import sqlite3
 import asyncio
@@ -188,9 +187,7 @@ async def handler(reader, writer):
                     # Conflict as version already updated
                     if version != seq:
                         state['txns'][sock] = dict(
-                            status='conflict',
-                            key=key, version=version, bytes=len(value),
-                            existing_version=seq)
+                            status='conflict', version=seq)
                         continue
 
                 seq += 1
@@ -637,58 +634,6 @@ def server():
     loop.run_forever()
 
 
-class Client():
-    def __init__(self, servers):
-        self.servers = servers
-        self.leader = None
-
-    def server_list(self):
-        servers = [self.leader] if self.leader else []
-        servers.extend(self.servers)
-
-        return servers
-
-    def state(self):
-        result = dict()
-
-        for ip, port in self.servers:
-            try:
-                server = '{}:{}'.format(ip, port)
-                with urllib.request.urlopen('http://' + server) as r:
-                    result[server] = json.loads(r.read())
-            except Exception:
-                pass
-
-        return result
-
-    def put(self, key, value):
-        value = value if type(value) is bytes else value.encode()
-
-        for ip, port in self.server_list():
-            try:
-                url = 'http://{}:{}/{}'.format(ip, port, key)
-                req = urllib.request.Request(url, data=value)
-                with urllib.request.urlopen(req) as r:
-                    self.leader = (ip, port)
-                    return dict(status=r.headers['KVLOG_STATUS'],
-                                version=r.headers['KVLOG_VERSION'],
-                                committed=r.headers['KVLOG_COMMITTED'])
-            except Exception:
-                pass
-
-    def get(self, key):
-        for ip, port in self.server_list():
-            try:
-                url = 'http://{}:{}/{}'.format(ip, port, key)
-                with urllib.request.urlopen(url) as r:
-                    self.leader = (ip, port)
-                    return dict(key=key, value=r.read(),
-                                lock=r.headers['KVLOG_LOCK'],
-                                version=r.headers['KVLOG_VERSION'])
-            except Exception:
-                pass
-
-
 if __name__ == '__main__':
     # openssl req -x509 -nodes -subj / -sha256 --keyout ssl.key --out ssl.cert
 
@@ -701,28 +646,11 @@ if __name__ == '__main__':
     args.add_argument('--db', dest='db', default='kvlog')
     args.add_argument('--password', dest='password')
 
-    args.add_argument('--key', dest='key')
-    args.add_argument('--file', dest='file')
-    args.add_argument('--value', dest='value')
     args = args.parse_args()
 
     args.token = hashlib.md5(args.token.encode()).digest()
 
-    if args.peers:
-        args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
-            p.split(':') for p in args.peers.split(',')]])
+    args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
+        p.split(':') for p in args.peers.split(',')]])
 
-    client = Client(args.peers)
-
-    if args.port:
-        server()
-    elif args.value:
-        pprint.pprint(client.put(args.key, args.value))
-    elif args.file:
-        pprint.pprint(client.put(args.key, open(args.file, 'rb').read()))
-    elif args.key:
-        pprint.pprint(client.get(args.key))
-    else:
-        for k, v in client.state().items():
-            print('{} : ({}, {}, {}, {})'.format(k, v['term'], v['seq'],
-                  v['committed'], v['role']))
+    server()
