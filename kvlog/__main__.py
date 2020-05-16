@@ -11,10 +11,8 @@ args.add_argument('--value', dest='value')
 args.add_argument('--peers', dest='peers')
 args = args.parse_args()
 
-args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
-        p.split(':') for p in args.peers.split(',')]])
-
-client = Client(args.peers)
+client = Client(sorted([(ip.strip(), int(port)) for ip, port in
+                        [p.split(':') for p in args.peers.split(',')]]))
 
 if args.value:
     pprint.pprint(client.put(args.key, args.value))
