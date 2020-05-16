@@ -4,8 +4,8 @@ import time
 import struct
 import sqlite3
 import asyncio
-import hashlib
 import logging
+import hashlib
 import argparse
 import mimetypes
 import urllib.parse
@@ -282,6 +282,15 @@ async def handler(reader, writer):
 
         return writer.close()
 
+    if 'token' == method:
+        msg = await reader.readexactly(
+            struct.unpack('!Q', await reader.readexactly(8))[0])
+        ip, port = msg.decode().split(':')
+
+        state['tokens'][(ip, int(port))] = await reader.readexactly(16)
+
+        return writer.close()
+
     # SYNC - That's why this project exists
     if 'sync' != method:
         return writer.close()
@@ -293,8 +302,8 @@ async def handler(reader, writer):
 
     try:
         # Reject any stray peer
-        if args.token != await reader.readexactly(16):
-            log('%s checksum mismatch', log_prefix())
+        if state['token'] != await reader.readexactly(16):
+            log('%s token mismatch', log_prefix())
             return writer.close()
 
         peer_term, peer_seq = struct.unpack(
@@ -450,7 +459,7 @@ async def sync():
 
                 # Tell the leader our current state.
                 # Leader would decide the starting point of replication.
-                writer.write(args.token)
+                writer.write(state['tokens'].get((ip, port), state['token']))
                 writer.write(struct.pack('!QQ', state['term'], state['seq']))
 
                 log('%s term(%d) seq(%d)', log_prefix,
@@ -515,9 +524,25 @@ async def sync():
 
 
 async def timekeeper():
-    t, sec = time.time(), int(time.time()*10**9 % 600)
+    t, sec = time.time(), int(time.time()*10**9 % 10)
 
-    await asyncio.sleep(sec)
+    while time.time() < t + sec:
+        for ip, port in args.peers:
+            try:
+                reader, writer = await asyncio.open_connection(ip, port)
+
+                my_ip = writer.get_extra_info('sockname')[0]
+                msg = '{}:{}'.format(my_ip, args.port).encode()
+
+                writer.write(b'TOKEN / HTTP/1.1\n\n')
+                writer.write(struct.pack('!Q', len(msg)))
+                writer.write(msg)
+                writer.write(state['token'])
+                writer.close()
+            except Exception:
+                pass
+
+        await asyncio.sleep(1)
 
     panic(True, 'timeout({}) elapsed({})'.format(sec, int(time.time()-t)))
 
@@ -587,8 +612,6 @@ if __name__ == '__main__':
     args.add_argument('--db', dest='db', default='kvlog.sqlite3')
     args = args.parse_args()
 
-    args.token = hashlib.md5(b'somejunk').digest()
-
     args.peers = sorted([(ip.strip(), int(port)) for ip, port in [
         p.split(':') for p in args.peers.split(',')]])
 
@@ -596,6 +619,8 @@ if __name__ == '__main__':
         txns=dict(),
         role='voter',
         followers=dict(),
+        token=hashlib.md5(str(int(time.time()*10**9)).encode()).digest(),
+        tokens=dict(),
         append_flag=asyncio.Event(),
         replicate_flag=asyncio.Event())
 
