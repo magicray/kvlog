@@ -2,7 +2,7 @@ from distutils.core import setup
 
 setup(
     name='kvlog',
-    version='0.7',
+    version='0.8',
     packages=['kvlog'],
     description='Synchronously replicated Key Value Log/Store',
     long_description='''

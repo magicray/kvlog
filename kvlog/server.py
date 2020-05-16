@@ -161,8 +161,8 @@ async def handler(reader, writer):
     if method in ('put', 'post') and type(req_key) is str:
         state['txns'][peername] = (req_key, req_version, req_content)
 
-        # Let's batch requests to limit the number of transactions
-        await asyncio.sleep(0.05)
+        # Let's batch requests till all log entries get replicated
+        await state['append_flag'].wait()
 
         # No one else has processed this batch so far
         if type(state['txns'][peername]) is tuple:
@@ -191,6 +191,8 @@ async def handler(reader, writer):
                 state['txns'][sock] = dict(status='fatal', version=seq)
 
             append_rows(rows)
+            state['append_flag'].clear()
+            state['replicate_flag'].set()
 
             for sock in state['txns']:
                 if type(state['txns'][sock]) is dict:
@@ -207,7 +209,8 @@ async def handler(reader, writer):
         # Let's wait till a quorum replicates the data in their logs
         if 'ok' == result['status']:
             while result['version'] > committed_seq():
-                await asyncio.sleep(0.05)
+                state['append_flag'].clear()
+                await state['append_flag'].wait()
 
         result['committed'] = committed_seq()
 
@@ -320,12 +323,12 @@ async def handler(reader, writer):
         # sync() starts following someone better than us
         state['followers'][peername] = 0
         while 'voter' == state['role'] and has_quorum() is False:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(1)
 
         # Reject as we started following someone else
         if 'follower' == state['role']:
             state['followers'].pop(peername)
-            log('%s rejected%s', log_prefix(), peername)
+            log('%s rejected%s as a follower', log_prefix(), peername)
             return writer.close()
 
         # Leader election - step 1 of 3
@@ -364,8 +367,11 @@ async def handler(reader, writer):
                 row_bytes += 40 + len(lock) + len(key) + len(value) + len(uuid)
 
             if not rows:
+                state['append_flag'].set()
+                state['replicate_flag'].clear()
+
                 # Avoid a busy loop
-                await asyncio.sleep(0.05)
+                await state['replicate_flag'].wait()
                 continue
 
             panic(state['role'] not in ('quorum', 'candidate', 'leader'),
@@ -411,10 +417,9 @@ async def handler(reader, writer):
 
             log('%s term(%d) seq(%d) rows(%d) bytes(%d)',
                 log_prefix(), peer_term, peer_seq, len(rows), row_bytes)
-    except Exception:
+    except Exception as e:
         state['followers'].pop(peername)
-        log('%s quorum(%s) rejected(%d)', log_prefix(), has_quorum(),
-            len(state['followers']))
+        log('%s exception(%s)', log_prefix(), e)
 
         # Had a quorum once but not anymore. Too many complex cases to handle.
         # Its safer to start from a clean slate.
@@ -460,7 +465,7 @@ async def sync():
         if reader:
             break
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(1)
 
     # We are already on our way to become a leader
     if 'voter' != state['role']:
@@ -510,9 +515,10 @@ async def sync():
 
 
 async def timekeeper():
-    t = time.time()
-    sec = int(time.time()*10**9 % 10)
+    t, sec = time.time(), int(time.time()*10**9 % 600)
+
     await asyncio.sleep(sec)
+
     panic(True, 'timeout({}) elapsed({})'.format(sec, int(time.time()-t)))
 
 
@@ -589,6 +595,8 @@ if __name__ == '__main__':
     state = dict(
         txns=dict(),
         role='voter',
-        followers=dict())
+        followers=dict(),
+        append_flag=asyncio.Event(),
+        replicate_flag=asyncio.Event())
 
     server()
