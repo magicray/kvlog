@@ -5,37 +5,39 @@ import struct
 import sqlite3
 import asyncio
 import logging
-import hashlib
 import argparse
 import mimetypes
 import urllib.parse
 import urllib.request
+from uuid import uuid4
 from logging import critical as log
 
 
-def append_rows(rows):
-    conn = sqlite3.connect(args.db)
+def append_rows(rows=[], fence=None):
+    try:
+        conn = sqlite3.connect(args.db)
 
-    for seq, lock, key, value, uuid in rows:
-        # Delete any redundant entries a crashed leader might have.
-        conn.execute('delete from kv where seq >= ?', (seq,))
+        # Delete any redundant entries existing in the log
+        if fence:
+            conn.execute('delete from kv where seq >= ?', (fence,))
 
-        # Replicate the entry we got from the leader
-        conn.execute('insert into kv values(?,?,?,?,?)', (seq,
-                     lock if lock else None,
-                     key if key else None,
-                     value if value else None,
-                     uuid if uuid else None))
+        for seq, lock, key, value, uuid in rows:
+            conn.execute('insert into kv values(?,?,?,?,?)', (seq,
+                         lock if lock else None,
+                         key if key else None,
+                         value if value else None,
+                         uuid if uuid else None))
 
-    state['seq'] = conn.execute('select max(seq) from kv').fetchone()[0]
-    state['term'] = conn.execute('''select seq from kv
-                                    where key is null
-                                    order by seq desc
-                                    limit 1
-                                 ''').fetchone()[0]
-
-    conn.commit()
-    conn.close()
+        state['seq'] = conn.execute('select max(seq) from kv').fetchone()[0]
+        state['term'] = conn.execute('''select seq from kv
+                               where key is null
+                               order by seq desc
+                               limit 1
+                            ''').fetchone()[0]
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        panic(True, 'commit exception({})'.format(e))
 
 
 def read_rows(seq, count=10000):
@@ -120,7 +122,7 @@ def committed_seq():
 
 def panic(cond, msg):
     if cond:
-        log('panic(%s)', msg)
+        log('panic %s', msg)
         os._exit(1)
 
 
@@ -143,7 +145,7 @@ async def handler(reader, writer):
     if 'get' == method and req_key is None:
         write_http(writer, '200 OK', dict(
             role=state['role'], term=state['term'], seq=state['seq'],
-            committed=committed_seq()))
+            committed=state['committed']))
         return writer.close()
 
     peername = writer.get_extra_info('peername')
@@ -208,13 +210,13 @@ async def handler(reader, writer):
         # Great - our request was not rejected due to a conflict.
         # Let's wait till a quorum replicates the data in their logs
         if 'ok' == result['status']:
-            while result['version'] > committed_seq():
+            while result['version'] > state['committed']:
                 state['append_flag'].clear()
                 await state['append_flag'].wait()
 
-        result['committed'] = committed_seq()
+        result['committed'] = state['committed']
 
-        write_http(writer, '200 OK', value, {
+        write_http(writer, '200 OK', b'', {
             'KVLOG_STATUS': result['status'],
             'KVLOG_VERSION': result.get('existing_version', result['version']),
             'KVLOG_COMMITTED': result['committed']})
@@ -226,7 +228,7 @@ async def handler(reader, writer):
     # READ
     if 'get' == method and type(req_key) is str:
         # Must not return data that is not replicated by a quorum
-        commit_seq = committed_seq()
+        commit_seq = state['committed']
 
         row = read_key(req_key, commit_seq)
         seq, lock, value = row if row else (0, '', b'')
@@ -296,9 +298,8 @@ async def handler(reader, writer):
         return writer.close()
 
     def log_prefix():
-        i = 1 if sockname[0] == peername[0] else 0
-        return 'master({}) slave({}) state({})'.format(
-            sockname[i], peername[i], state['role'])
+        return 'master({}:{}) slave({}:{}) state({})'.format(
+            sockname[0], sockname[1], peername[0], peername[1], state['role'])
 
     try:
         # Reject any stray peer
@@ -309,13 +310,23 @@ async def handler(reader, writer):
         peer_term, peer_seq = struct.unpack(
             '!QQ', await reader.readexactly(16))
 
-        log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
+        ip_port = await reader.readexactly(
+                struct.unpack('!Q', await reader.readexactly(8))[0])
+        ip_port = ip_port.decode().split(':')
+        peername = (ip_port[0], int(ip_port[1]))
+
+        # Reject if the previous request from this peer is not gone yet
+        if peername in state['followers']:
+            log('%s old instance still active', log_prefix())
+            return writer.close()
 
         # Reject a follower if my state is worse than peer's state
         if (state['term'], state['seq']) < (peer_term, peer_seq):
             log('%s rejected as (%d %d) < (%d %d)', log_prefix(),
                 state['term'], state['seq'], peer_term, peer_seq)
             return writer.close()
+
+        log('%s term(%d) seq(%d)', log_prefix(), peer_term, peer_seq)
 
         # Decided to accept this follower, lets calculate common max seq
         # Following is always correct, though we are sending data that a
@@ -332,7 +343,7 @@ async def handler(reader, writer):
         # sync() starts following someone better than us
         state['followers'][peername] = 0
         while 'voter' == state['role'] and has_quorum() is False:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
         # Reject as we started following someone else
         if 'follower' == state['role']:
@@ -344,10 +355,10 @@ async def handler(reader, writer):
         # Have a quorum and not following anyone else
         if 'voter' == state['role']:
             state['role'] = 'quorum'
-            log('%s term(%d)', log_prefix(), state['seq']+1)
+            log('%s term(%d)', log_prefix(), state['seq'] + 1)
 
         # Signal to the peer that it has been accepted as a follower
-        writer.write(struct.pack('!Q', 0))
+        writer.write(struct.pack('!Q', next_seq))
 
         # And start sending the data
         while True:
@@ -392,40 +403,36 @@ async def handler(reader, writer):
                 '!QQ', await reader.readexactly(16))
 
             state['followers'][peername] = peer_seq
+            state['committed'] = committed_seq()
 
             next_seq = peer_seq + 1
 
-            # Leader election - step 2 of 3
-            # Wait for a quorum to fully replicate its log. Then insert a row
-            # with null key to declare its candidature for leadership. The
-            # seq for this row is the term number during new leaders reign.
-            if 'quorum' == state['role']:
-                # Quorum is in sync with its logs
-                if state['seq'] == committed_seq():
-                    new_term = state['seq'] + 1
-                    append_rows([(new_term, None, None, None,
-                                  str((sockname, new_term,
-                                       int(time.time()*10**9), os.getpid())))])
-
-                    state['role'] = 'candidate'
-                    log('%s term(%d)', log_prefix(), new_term)
-                    continue
-
-            # Leader election - step 3 of 3
-            # Wait for a quorum to fully replicate its log, including the row
-            # with null key, declaring the candidature of the new leader.
-            # Since a quorum has accepted this new row and the logs are in sync
-            # There is no backing off. Its safe to accept update requests.
-            #
-            # Leader is elected for the new term. WooHoo.
-            if 'candidate' == state['role']:
-                # Quorum is in sync with its logs
-                if state['seq'] == committed_seq():
-                    state['role'] = 'leader'
-                    log('%s term(%s)', log_prefix(), state['term'])
-
             log('%s term(%d) seq(%d) rows(%d) bytes(%d)',
                 log_prefix(), peer_term, peer_seq, len(rows), row_bytes)
+
+            # We are either already a leader or a majority is not yet in sync
+            # Leader - Nothing more to be done.
+            # Logs not in sync - Can't move forward on leader election yet.
+            if 'leader' == state['role'] or state['seq'] != state['committed']:
+                continue
+
+            # Leader election - step 2 of 3
+            # Insert a row with null key to declare its candidature.
+            # The seq for this row is the term number for this leader's reign.
+            if 'quorum' == state['role']:
+                append_rows([(state['seq'] + 1, None, None, None,
+                              str((sockname, state['seq'] + 1,
+                                   int(time.time()*10**9), os.getpid())))])
+
+                state['role'] = 'candidate'
+
+            # Leader election - step 3 of 3
+            # Since a quorum has accepted new row and the logs are in sync
+            # There is no backing off. Its safe to accept update requests.
+            elif 'candidate' == state['role']:
+                state['role'] = 'leader'
+
+            log('%s term(%s)', log_prefix(), state['term'])
     except Exception as e:
         state['followers'].pop(peername)
         log('%s exception(%s)', log_prefix(), e)
@@ -450,9 +457,8 @@ async def sync():
                 reader = None
                 continue
 
-            i = 1 if sockname[0] == peername[0] else 0
-            log_prefix = 'slave({}) master({})'.format(
-                sockname[i], peername[i])
+            log_prefix = 'slave({}:{}) master({}:{})'.format(
+                sockname[0], args.port, peername[0], peername[1])
 
             try:
                 writer.write(b'SYNC / HTTP/1.1\n\n')
@@ -462,10 +468,15 @@ async def sync():
                 writer.write(state['tokens'].get((ip, port), state['token']))
                 writer.write(struct.pack('!QQ', state['term'], state['seq']))
 
+                ip_port = '{}:{}'.format(sockname[0], args.port).encode()
+                writer.write(struct.pack('!Q', len(ip_port)))
+                writer.write(ip_port)
+
                 log('%s term(%d) seq(%d)', log_prefix,
                     state['term'], state['seq'])
 
-                await reader.readexactly(8)
+                # Delete all the rows including and after this sequence
+                fence = struct.unpack('!Q', await reader.readexactly(8))[0]
                 break
             except Exception:
                 reader = None
@@ -474,7 +485,7 @@ async def sync():
         if reader:
             break
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
 
     # We are already on our way to become a leader
     if 'voter' != state['role']:
@@ -514,7 +525,8 @@ async def sync():
                          value,
                          uuid.decode()))
 
-        append_rows(rows)
+        append_rows(rows, fence)
+        fence = None
 
         log('%s term(%d) seq(%d) rows(%d) bytes(%d)',
             log_prefix, state['term'], state['seq'], len(rows), row_bytes)
@@ -542,7 +554,10 @@ async def timekeeper():
             except Exception:
                 pass
 
-        await asyncio.sleep(1)
+        if 'follower' == state['role']:
+            await asyncio.sleep(sec)
+        else:
+            await asyncio.sleep(1)
 
     panic(True, 'timeout({}) elapsed({})'.format(sec, int(time.time()-t)))
 
@@ -588,7 +603,7 @@ def server():
     conn.commit()
     conn.close()
 
-    append_rows([])
+    append_rows()
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.start_server(handler, '', args.port))
@@ -618,8 +633,9 @@ if __name__ == '__main__':
     state = dict(
         txns=dict(),
         role='voter',
+        committed=0,
         followers=dict(),
-        token=hashlib.md5(str(int(time.time()*10**9)).encode()).digest(),
+        token=uuid4().bytes,
         tokens=dict(),
         append_flag=asyncio.Event(),
         replicate_flag=asyncio.Event())
